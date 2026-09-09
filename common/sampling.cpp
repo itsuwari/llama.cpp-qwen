@@ -917,3 +917,31 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
 
     return samplers;
 }
+
+std::vector<llama_token> common_sampler_sample_and_accept_h90(
+        common_sampler * smpl,llama_context * ctx,const std::vector<int>&idxs,
+        const llama_tokens & draft,const std::vector<h90_draft_step>&qs,std::mt19937 & rng) {
+    const auto &cfg=smpl->params;
+    if(!(cfg.temp>0) || cfg.mirostat || cfg.adaptive_target>=0 || cfg.xtc_probability>0 ||
+       smpl->grmr || smpl->rbudget || cfg.n_probs || idxs.size()!=draft.size()+1 || qs.size()<draft.size())
+        throw std::runtime_error("Experimental rejection sampler requires positive temperature, CPU stateless sampling, no grammar/budget/probability output and aligned proposal rows");
+    std::vector<llama_token> result;result.reserve(idxs.size());
+    for(size_t i=0;i<draft.size();++i) {
+        if(qs[i].sampled!=draft[i])throw std::runtime_error("Draft probability provenance mismatch");
+        if(llama_get_sampled_token_ith(ctx,idxs[i])!=LLAMA_TOKEN_NULL)
+            throw std::runtime_error("Probability-ratio verification requires CPU sampling with the full filtered target distribution");
+        (void)common_sampler_sample(smpl,ctx,idxs[i],true);
+        h90_distribution p;p.reserve(smpl->cur_p.size);
+        for(size_t j=0;j<smpl->cur_p.size;++j)if(smpl->cur_p.data[j].p>0)
+            p.push_back({smpl->cur_p.data[j].id,double(smpl->cur_p.data[j].p)});
+        p=h90_normalize(std::move(p));
+        const auto decision=h90_reject_step(p,qs[i].q,draft[i],
+               std::generate_canonical<double,53>(rng),std::generate_canonical<double,53>(rng));
+        static int checked=0;
+        if(checked++<8)LOG_INF("H90_REJECTION_STEP i=%zu p_support=%zu q_support=%zu p=%.6f q=%.6f accept=%d\n",i,p.size(),qs[i].q.size(),h90_prob_at(p,draft[i]),h90_prob_at(qs[i].q,draft[i]),int(decision.accepted));
+        common_sampler_accept(smpl,decision.token,true);result.push_back(decision.token);
+        if(!decision.accepted)return result;
+    }
+    const llama_token bonus=common_sampler_sample(smpl,ctx,idxs.back(),true);
+    common_sampler_accept(smpl,bonus,true);result.push_back(bonus);return result;
+}

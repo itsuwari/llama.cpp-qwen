@@ -2348,6 +2348,9 @@ struct llama_model_qwen35 : public llama_model_base {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
+    ggml_tensor * draft_head_down = nullptr;
+    ggml_tensor * draft_head_up = nullptr;
+
     class llm_graph_input_qsa;
 
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2355,7 +2358,21 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        struct no_build_t {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
+            llm_build_delta_net_base(params), model(model) {}
+        struct qsa_selection {
+            ggml_tensor * mask = nullptr;
+            ggml_tensor * indices = nullptr;
+            ggml_tensor * index_mask = nullptr;
+        };
+
+        ggml_tensor * build_hc_reduce(
+                    ggml_tensor * input,
+                    ggml_tensor * gate,
+                            int   il);
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2393,6 +2410,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        std::map<uint32_t, llm_graph_input_i *> qsa_cached_inps;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
@@ -2400,6 +2418,15 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
+                            int * sections,
+                            int   il);
+
+        qsa_selection build_qsa_selection(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * k_storage,
                             int * sections,
                             int   il);
 
@@ -2445,6 +2472,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

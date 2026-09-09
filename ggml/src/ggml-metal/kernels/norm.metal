@@ -74,7 +74,7 @@ kernel void kernel_norm_fuse_impl(
 
     const float variance = sumf/args.ne00;
 
-    const float scale = 1.0f/sqrt(variance + args.eps);
+    const float scale = args.post_scale/sqrt(variance + args.eps);
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         if (F == 1) {
             y[i00] = (y[i00]*scale);
@@ -147,7 +147,7 @@ kernel void kernel_rms_norm_fuse_impl(
     sumf = simd_sum(sumf);
 
     const float mean  = sumf/args.ne00;
-    const float scale = 1.0f/sqrt(mean + args.eps);
+    const float scale = args.post_scale/sqrt(mean + args.eps);
 
     device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
@@ -160,10 +160,18 @@ kernel void kernel_rms_norm_fuse_impl(
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
         }
+        if (F == 4) {
+            const T weighted = (x[i00]*scale)*f0[i00];
+            const T gate = T(1.0f)/(T(1.0f) + exp(-f1[i00]));
+            y[i00] = weighted*gate;
+        }
     }
 }
 
 typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
+
+template [[host_name("kernel_rms_norm_mul_sigmoid_f32")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 4>;
+template [[host_name("kernel_rms_norm_mul_sigmoid_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 4>;
 
 template [[host_name("kernel_rms_norm_f32")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 1>;
 template [[host_name("kernel_rms_norm_mul_f32")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 2>;

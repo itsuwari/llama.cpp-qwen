@@ -704,6 +704,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
 }
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv) {
+    return ggml_metal_library_compile_pipeline_bounded(lib, base, name, cv, 0);
+}
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline_bounded(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv, int max_threads) {
     struct ggml_metal_pipeline_with_params res = {
         /*.pipeline =*/ nil,
         /*.nsg      =*/ 0,
@@ -767,7 +771,18 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         }
 
         id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
-        id<MTLComputePipelineState> obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
+        id<MTLComputePipelineState> obj;
+        if (max_threads > 0 && getenv("GGML_METAL_LAUNCH_BOUNDS")) {
+            MTLComputePipelineDescriptor * descriptor = [[MTLComputePipelineDescriptor alloc] init];
+            descriptor.computeFunction = mtl_function;
+            descriptor.maxTotalThreadsPerThreadgroup = (NSUInteger) max_threads;
+            descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            obj = [device newComputePipelineStateWithDescriptor:descriptor
+                    options:MTLPipelineOptionNone reflection:nil error:&error];
+            [descriptor release];
+        } else {
+            obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
+        }
 
         [mtl_function release];
 
@@ -812,14 +827,32 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 // MTLComputeCommandEncoder wrapper
 //
 
+enum { GGML_METAL_LAB_MAX_RECORDS = 2048 };
+
+struct ggml_metal_lab_record {
+    char name[GGML_MAX_NAME];
+    char weight_type[32];
+    int op;
+    int64_t ne[4];
+    int64_t wne[4];
+};
+
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    id<MTLCommandBuffer> cmd_buf;
+    id<MTLCounterSampleBuffer> counters;
+    struct ggml_metal_lab_record * records;
+    int n_records;
+    int n_profile_seen;
+    int n_profile_skip;
+    bool profile_saturated;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    res->cmd_buf = cmd_buf;
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -830,6 +863,75 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     [res->obj retain];
 
     return res;
+}
+
+void ggml_metal_encoder_profile_enable(ggml_metal_encoder_t encoder) {
+    encoder->n_profile_skip = getenv("GGML_METAL_LAB_OP_SKIP") ? atoi(getenv("GGML_METAL_LAB_OP_SKIP")) : 0;
+    id<MTLDevice> dev = encoder->cmd_buf.device;
+    if (![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        return;
+    }
+    id<MTLCounterSet> timestamps = nil;
+    for (id<MTLCounterSet> cs in dev.counterSets) {
+        if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+            timestamps = cs;
+            break;
+        }
+    }
+    if (!timestamps) {
+        return;
+    }
+    MTLCounterSampleBufferDescriptor * desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+    desc.counterSet = timestamps;
+    desc.storageMode = MTLStorageModeShared;
+    desc.sampleCount = 2*GGML_METAL_LAB_MAX_RECORDS;
+    NSError * error = nil;
+    encoder->counters = [dev newCounterSampleBufferWithDescriptor:desc error:&error];
+    [desc release];
+    if (!encoder->counters) {
+        fprintf(stderr, "OPPROFILE ERROR %s\n", error.localizedDescription.UTF8String);
+        return;
+    }
+    encoder->records = calloc(GGML_METAL_LAB_MAX_RECORDS, sizeof(struct ggml_metal_lab_record));
+    GGML_ASSERT(encoder->records);
+}
+
+void ggml_metal_encoder_profile_next(ggml_metal_encoder_t encoder, const struct ggml_tensor * node) {
+    if (!encoder->counters) {
+        return;
+    }
+    if (encoder->n_profile_seen++ < encoder->n_profile_skip) {
+        return;
+    }
+    if (encoder->n_records >= GGML_METAL_LAB_MAX_RECORDS) {
+        // Close the final measured operation before recording any unmeasured
+        // tail. Otherwise its timestamp silently includes all remaining work.
+        if (!encoder->profile_saturated) {
+            [encoder->obj endEncoding];
+            [encoder->obj release];
+            encoder->obj = [[encoder->cmd_buf computeCommandEncoder] retain];
+            encoder->profile_saturated = true;
+            fprintf(stderr, "OPPROFILE_TRUNCATED records=%d\n", encoder->n_records);
+        }
+        return;
+    }
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+    MTLComputePassDescriptor * pass = [MTLComputePassDescriptor computePassDescriptor];
+    pass.dispatchType = MTLDispatchTypeSerial;
+    MTLComputePassSampleBufferAttachmentDescriptor * att = pass.sampleBufferAttachments[0];
+    att.sampleBuffer = encoder->counters;
+    att.startOfEncoderSampleIndex = 2*encoder->n_records;
+    att.endOfEncoderSampleIndex = 2*encoder->n_records + 1;
+    encoder->obj = [[encoder->cmd_buf computeCommandEncoderWithDescriptor:pass] retain];
+    struct ggml_metal_lab_record * record = &encoder->records[encoder->n_records++];
+    snprintf(record->name, sizeof(record->name), "%s", node->name);
+    record->op = node->op;
+    memcpy(record->ne, node->ne, sizeof(record->ne));
+    if (node->src[0]) {
+        memcpy(record->wne, node->src[0]->ne, sizeof(record->wne));
+        snprintf(record->weight_type, sizeof(record->weight_type), "%s", ggml_type_name(node->src[0]->type));
+    }
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
@@ -880,6 +982,35 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
+    if (encoder->counters) {
+        id<MTLCounterSampleBuffer> counters = encoder->counters;
+        const int n = encoder->n_records;
+        struct ggml_metal_lab_record * records = encoder->records;
+        [encoder->cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            @autoreleasepool {
+                NSData * data = [counters resolveCounterRange:NSMakeRange(0, 2*n)];
+                if (cb.status == MTLCommandBufferStatusCompleted && data.length >= 2*n*sizeof(MTLCounterResultTimestamp)) {
+                    const MTLCounterResultTimestamp * times = data.bytes;
+                    for (int i = 0; i < n; ++i) {
+                        const uint64_t t0 = times[2*i].timestamp;
+                        const uint64_t t1 = times[2*i + 1].timestamp;
+                        const struct ggml_metal_lab_record * r = records + i;
+                        fprintf(stderr, "OPPROFILE %s %s %s %lld,%lld,%lld,%lld %lld,%lld,%lld,%lld %llu\n",
+                            ggml_op_name(r->op), r->name, r->weight_type,
+                            (long long) r->ne[0], (long long) r->ne[1], (long long) r->ne[2], (long long) r->ne[3],
+                            (long long) r->wne[0], (long long) r->wne[1], (long long) r->wne[2], (long long) r->wne[3],
+                            (unsigned long long) (t1 >= t0 ? t1 - t0 : 0));
+                    }
+                } else {
+                    fprintf(stderr, "OPPROFILE ERROR resolve_bytes=%lu status=%lu\n", (unsigned long)data.length, (unsigned long)cb.status);
+                }
+                free(records);
+            }
+        }];
+        [encoder->counters release];
+        encoder->counters = nil;
+        encoder->records = NULL;
+    }
 }
 
 struct ggml_metal_device {
@@ -1741,6 +1872,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            return has_simdgroup_reduction &&
+                (op->src[0]->ne[1] == 1 || has_simdgroup_mm) &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                ((op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16) ||
+                 (op->src[1]->type == GGML_TYPE_Q8_0 && op->src[2]->type == GGML_TYPE_Q8_0 && op->src[0]->ne[1] > 1)) &&
+                op->src[3]->type == GGML_TYPE_I32 &&
+                op->src[4]->type == GGML_TYPE_F16 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
+                op->src[2]->ne[0] == OP_FLASH_ATTN_EXT_INDEXED_D &&
+                op->src[0]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_HEAD &&
+                op->src[1]->ne[2] == OP_FLASH_ATTN_EXT_INDEXED_N_KV &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                ggml_is_contiguous(op->src[4]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK ||
                 op->src[0]->ne[1] != OP_LIGHTNING_INDEXER_NH) {
@@ -1807,6 +1957,50 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 ggml_is_contiguous_rows(op->src[3]);
+        case GGML_OP_QWEN4EXP_HC_REDUCE:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[1] == 4 &&
+                op->src[0]->ne[3] == 1 &&
+                ggml_are_same_shape(op->src[0], op->src[1]) &&
+                op->ne[0] == op->src[0]->ne[0] &&
+                op->ne[1] == op->src[0]->ne[2] &&
+                op->ne[2] == 1 &&
+                op->ne[3] == 1 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_QWEN4EXP_HC_COMBINE:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[1] == 4 &&
+                op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[0] == op->src[0]->ne[0] &&
+                op->src[1]->ne[1] == op->src[0]->ne[2] &&
+                op->src[2]->ne[0] == 4 &&
+                op->src[2]->ne[1] == op->src[0]->ne[2] &&
+                ggml_are_same_shape(op, op->src[0]) &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op);
+        case GGML_OP_QSA_BLOCK_SCORE:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_I32 &&
+                op->src[3]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == OP_QSA_BLOCK_SCORE_D &&
+                op->src[0]->ne[1] == OP_QSA_BLOCK_SCORE_NH &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:

@@ -257,6 +257,7 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+    std::mt19937 h90_reject_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -1804,6 +1805,15 @@ private:
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
+            if (spec && std::getenv("LLAMA_H90_REJECTION")) {
+                const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                    ? std::random_device{}() : task.params.sampling.seed;
+                // Domain-separated request-local stream, independent of target
+                // categorical sampling and the native drafter's random stream.
+                std::seed_seq independent_seed{seed, uint32_t(slot.id), 0xa591c63du, 0x24ef017bu};
+                slot.h90_reject_rng.seed(independent_seed);
+            }
+
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
@@ -3062,7 +3072,13 @@ private:
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                const bool preserve_mtp_kv = std::getenv("LLAMA_MTP_REUSE_KV") && !use_ckpt_dft &&
+                    slots.size() == 1 &&
+                    std::count(params_base.speculative.types.begin(), params_base.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == 1 &&
+                    std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type t) {
+                        return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                    });
+                if (!preserve_mtp_kv && !llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }
@@ -3912,11 +3928,16 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                const auto * h90_q=common_speculative_get_h90_probs(spec.get(),slot.id);
+                if(h90_q && (!synth_probs.empty() || slot.spec_is_replay))
+                    throw std::runtime_error("Probability-ratio experiment does not support synthetic acceptance or checkpoint replay");
+                auto accepted = h90_q
+                    ? common_sampler_sample_and_accept_h90(slot.smpl.get(),slot.ctx_tgt,slot.spec_i_batch,slot.spec_draft,*h90_q,slot.h90_reject_rng)
+                    : (synth_probs.empty()
+                        ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                        : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay));
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

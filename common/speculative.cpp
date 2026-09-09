@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "r95-argmax.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -162,6 +163,7 @@ struct common_speculative_impl {
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
     virtual ~common_speculative_impl() = default;
+    virtual const std::vector<h90_draft_step> * h90_probabilities(llama_seq_id) const {return nullptr;}
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
@@ -1332,6 +1334,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd = 0;
+    int r95_argmax_mode = 0;
+    float r95_width_gate = -1.0f;
+    float r95_previous_confidence = 1.0f;
+    uint64_t r95_short_rounds=0,r95_long_rounds=0;
+    uint64_t r95_argmax_checks = 0;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1353,6 +1360,171 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+
+    int vocab_cap=0;
+    int vocab_base=4096;
+    int vocab_last_row=-1;
+    uint64_t vocab_updates=0;
+    float vocab_margin=12.0f;
+    std::vector<llama_token> vocab_recent;
+    std::vector<llama_token> vocab_prompt;
+    std::vector<llama_token> vocab_candidates;
+    std::vector<uint8_t> vocab_seen;
+
+    void update_target_vocab() {
+        const float * logits=llama_get_logits_ith(params.ctx_tgt,vocab_last_row);
+        const int nv=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_tgt)));
+        GGML_ASSERT(logits && nv>vocab_cap);
+        float peak=-INFINITY;
+        for(int i=0;i<nv;++i) peak=std::max(peak,logits[i]);
+        std::vector<std::pair<float,llama_token>> top;
+        for(int i=0;i<nv;++i) if(logits[i]>=peak-vocab_margin) top.emplace_back(logits[i],i);
+        const size_t max_top=size_t(vocab_cap)/2;
+        if(top.size()>max_top) {
+            std::nth_element(top.begin(),top.begin()+max_top,top.end(),[](const auto & a,const auto & b){return a.first>b.first;});
+            top.resize(max_top);
+        }
+        vocab_seen.assign(nv,0);vocab_candidates.clear();
+        auto add=[&](llama_token id) {
+            if(id>=0 && id<nv && !vocab_seen[id] && vocab_candidates.size()<size_t(vocab_cap)) {
+                vocab_seen[id]=1;vocab_candidates.push_back(id);
+            }
+        };
+        for(const auto & item:top) add(item.second);
+        for(int i=0;i<std::min(vocab_base,vocab_cap/2);++i) add(i);
+        for(auto it=vocab_prompt.rbegin();it!=vocab_prompt.rend();++it) add(*it);
+        for(auto it=vocab_recent.rbegin();it!=vocab_recent.rend();++it) add(*it);
+        for(int i=0;i<nv && vocab_candidates.size()<size_t(vocab_cap);++i) add(i);
+        vocab_recent=vocab_candidates;
+        std::sort(vocab_candidates.begin(),vocab_candidates.end());
+        llama_set_draft_vocab(params.ctx_dft,vocab_candidates.data(),vocab_candidates.size());
+        ++vocab_updates;
+    }
+
+    // Request-local width policy; optimize total accepted tokens / total time.
+    // All candidate tokens still pass through the original target verifier.
+    bool h90_adaptive = false;
+    bool h90_telemetry = false;
+    int h90_width = 3;
+    int h90_round = 0;
+    int h90_proposals = 0;
+    int64_t h90_start_us = 0;
+    double h90_tokens[9] = {};
+    double h90_time_us[9] = {};
+    uint64_t h90_visits[9] = {};
+    uint64_t h90_reached[9] = {};
+    uint64_t h90_accepted[9] = {};
+
+    std::vector<float> h90_alignment;
+    std::vector<float> h90_aligned;
+    float h90_alignment_mix = 0.0f;
+    uint64_t h90_alignment_calls = 0;
+
+    bool h90_rejection = false;
+    double h90_suffix_mix=0;
+    bool h90_phase=false,h90_thinking=true;
+    llama_token h90_think_end=LLAMA_TOKEN_NULL;
+    std::vector<llama_pos> h90_verify_positions;
+    std::vector<int> h90_verify_indices;
+    std::vector<llama_token> h90_verify_tokens;
+    std::map<llama_pos,h90_distribution> h90_previous_suffix;
+    uint64_t h90_suffix_hits=0,h90_suffix_cached=0,h90_think_rounds=0,h90_answer_rounds=0;
+    h90_distribution h90_teacher_proposal(const float * logits,int nv) {
+        float peak=-INFINITY;
+        for(int id=0;id<nv;++id) if(std::isfinite(logits[id])) peak=std::max(peak,logits[id]);
+        if(!std::isfinite(peak)) throw std::runtime_error("No finite suffix logits");
+        h90_distribution q;
+        for(int id=0;id<nv;++id) if(logits[id]>=peak-12 && std::isfinite(logits[id])) q.push_back({id,double(logits[id])});
+        if(q.size()>64) {
+            std::partial_sort(q.begin(),q.begin()+64,q.end(),[](const h90_prob&a,const h90_prob&b){return a.p>b.p || (a.p==b.p && a.id<b.id);});q.resize(64);
+        }
+        for(auto & x:q) x.p=std::exp(x.p-peak);
+        return h90_normalize(std::move(q));
+    }
+
+    std::mt19937_64 h90_draft_rng{0x98523178u};
+    std::vector<h90_draft_step> h90_draft_probabilities;
+    const std::vector<h90_draft_step> * h90_probabilities(llama_seq_id seq) const override {
+        return h90_rejection && seq==0 && !h90_draft_probabilities.empty() ? &h90_draft_probabilities : nullptr;
+    }
+    int h90_bias_mode = 0;
+    float h90_bias_eta = 0.25f;
+    uint64_t h90_bias_prev2 = 0, h90_bias_prev1 = 0;
+    uint64_t h90_bias_updates = 0;
+    std::map<uint64_t,std::map<llama_token,float>> h90_bias_table;
+    std::vector<uint64_t> h90_bias_keys;
+    std::vector<llama_token> h90_bias_ids;
+    struct h90_restore_logits {
+        float * values = nullptr;
+        std::vector<std::pair<llama_token,float>> original;
+        void restore() {if(values) {for(const auto & v:original) values[v.first]=v.second;values=nullptr;}}
+        ~h90_restore_logits(){restore();}
+    };
+    uint64_t h90_bias_key() const {
+        if(h90_bias_mode==1)return 0;
+        if(h90_bias_mode==2)return h90_bias_prev1;
+        return (h90_bias_prev2<<32)|h90_bias_prev1;
+    }
+
+    bool feedback_enabled = false;
+    float feedback_mix = 0.0f;
+    int feedback_count = 0;
+    uint64_t feedback_seen = 0;
+    uint64_t feedback_total = 0;
+    double feedback_cosine_sum = 0.0;
+    std::vector<float> feedback_rows;
+    std::vector<float> feedback_bias;
+    std::vector<float> feedback_adjusted;
+
+    bool reuse_kv = false;
+    int reuse_correct = 1;
+    uint64_t reuse_rounds = 0;
+    uint64_t reuse_rows_saved = 0;
+    bool defer_enabled = false;
+    bool defer_next_process = false;
+    llama_pos deferred_from = -1;
+    std::vector<llama_token> deferred_tokens;
+    std::vector<llama_pos> deferred_positions;
+    std::vector<float> deferred_inputs;
+    uint64_t deferred_rounds = 0;
+    uint64_t deferred_rows_used = 0;
+
+    uint64_t lookup_rounds = 0;
+    uint64_t lookup_tokens = 0;
+    uint64_t lookup_accepted = 0;
+    bool lookup_active = false;
+
+    bool history_proposal(common_speculative_draft_params & dp) {
+        static const int min_match = getenv("LLAMA_MTP_LOOKUP_N") ? atoi(getenv("LLAMA_MTP_LOOKUP_N")) : 0;
+        if (min_match < 4 || min_match > 32 || n_seq != 1 || defer_enabled || chain_heads || is_mem_shared ||
+            !dp.prompt || !dp.result || !dp.result->empty()) return false;
+        const auto & past = *dp.prompt;
+        const int64_t n = (int64_t) past.size();
+        const int n_max = dp.n_max < 0 ? params.n_max : std::min(params.n_max, dp.n_max);
+        if (n_max < 2 || n < min_match + 2) return false;
+        int64_t best = -1;
+        int best_match = min_match - 1;
+        const int64_t begin = std::max<int64_t>(min_match - 1, n - 4096);
+        for (int64_t j = n - 3; j >= begin; --j) {
+            if (past[j] != dp.id_last) continue;
+            int matched = 1;
+            while (matched < 32 && matched <= j && matched <= n &&
+                   past[j - matched] == past[n - matched]) ++matched;
+            if (matched > best_match) {
+                best_match = matched;
+                best = j;
+            }
+            if (best_match == 32) break;
+        }
+        if (best < 0) return false;
+        const int count = (int) std::min<int64_t>(n_max, n - best - 1);
+        if (count < 2) return false;
+        dp.result->assign(past.begin() + best + 1, past.begin() + best + 1 + count);
+        ++lookup_rounds;
+        lookup_tokens += count;
+        lookup_active = true;
+        return true;
+    }
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1386,12 +1558,60 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
+        if (const char * v=std::getenv("LLAMA_MTP_R95_ARGMAX")) {
+            r95_argmax_mode=std::atoi(v);
+            if(r95_argmax_mode<0 || r95_argmax_mode>3 || this->params.p_min!=0.0f || this->params.backend_sampling)
+                throw std::runtime_error("R95 argmax requires CPU drafting with p_min=0 and mode 0..3");
+            LOG_INF("R95_ARGMAX mode=%d\n",r95_argmax_mode);
+        }
+        if(const char * value=std::getenv("LLAMA_MTP_R95_WIDTH_GATE")) {
+            r95_width_gate=std::strtof(value,nullptr);
+            if(!std::isfinite(r95_width_gate) || r95_width_gate<0 || r95_width_gate>1 || n_seq!=1 ||
+               this->params.n_max!=7 || this->params.p_min!=0 || this->params.backend_sampling || r95_argmax_mode)
+                throw std::runtime_error("Width gate requires CPU MTP7, p_min=0 and a finite 0..1 threshold");
+        }
+        h90_adaptive = std::getenv("LLAMA_H90_ADAPTIVE") != nullptr;
+        h90_telemetry = h90_adaptive || std::getenv("LLAMA_H90_DRAFT_TRACE");
+        if(h90_adaptive && (n_seq != 1 || this->params.n_max != 5 || this->params.p_min != 0 ||
+           r95_width_gate >= 0 || r95_argmax_mode || chain_heads))
+            throw std::runtime_error("H90 adaptive mode requires single-sequence native MTP5 and p_min=0");
+        if(const char * v=std::getenv("LLAMA_H90_TOKEN_BIAS")) {
+            h90_bias_mode=std::atoi(v);
+            if(const char * eta=std::getenv("LLAMA_H90_TOKEN_BIAS_ETA"))h90_bias_eta=std::strtof(eta,nullptr);
+            if(h90_bias_mode<1 || h90_bias_mode>3 || n_seq!=1 || this->params.backend_sampling ||
+               !std::isfinite(h90_bias_eta) || h90_bias_eta<=0 || h90_bias_eta>2)
+                throw std::runtime_error("Token-bias experiment requires one CPU-sampled draft sequence and bounded finite step size");
+        }
+        h90_rejection=std::getenv("LLAMA_H90_REJECTION")!=nullptr;
+        if(h90_rejection && (n_seq!=1 || this->params.backend_sampling || this->params.p_min!=0 ||
+                            h90_bias_mode || r95_argmax_mode || r95_width_gate>=0 || vocab_cap))
+            throw std::runtime_error("Probability-ratio drafting requires single CPU MTP, p_min=0 and no alternative proposal policy");
+        if(h90_rejection)LOG_INF("H90_REJECTION enabled: stochastic proposals, stored q, exact residual correction\n");
+        if(const char * value=std::getenv("LLAMA_H90_SUFFIX_MIX")) {
+            h90_suffix_mix=std::strtod(value,nullptr);
+            if(!std::isfinite(h90_suffix_mix) || h90_suffix_mix<0 || h90_suffix_mix>1 || !h90_rejection || n_seq!=1) throw std::runtime_error("Invalid suffix-mixture configuration");
+        }
+        h90_phase=std::getenv("LLAMA_H90_PHASE_WIDTH")!=nullptr;
+        if(h90_phase) {
+            if(!h90_rejection || n_seq!=1 || h90_adaptive || this->params.n_max!=5) throw std::runtime_error("Phase width requires probability-ratio MTP5");
+            const auto ids=common_tokenize(this->params.ctx_tgt,"</think>",false,true);
+            if(ids.size()!=1) throw std::runtime_error("Thinking-end token is non-atomic");
+            h90_think_end=ids[0];h90_telemetry=true;
+        }
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = r95_argmax_mode==1 ? 1 : 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            if(h90_rejection) {
+                sparams.top_k=20;sparams.top_p=0.95f;sparams.min_p=0;sparams.temp=1.0f;
+                if(const char * t=std::getenv("LLAMA_H90_DRAFT_TEMP"))sparams.temp=std::strtof(t,nullptr);
+                if(!std::isfinite(sparams.temp) || sparams.temp<0.05f || sparams.temp>2.0f)
+                    throw std::runtime_error("Draft temperature must be finite and in [0.05,2]");
+                sparams.samplers={COMMON_SAMPLER_TYPE_TOP_K,COMMON_SAMPLER_TYPE_TOP_P,COMMON_SAMPLER_TYPE_TEMPERATURE};
+            }
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
@@ -1426,7 +1646,70 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+        defer_enabled = std::getenv("LLAMA_MTP_DEFER_CATCHUP") != nullptr &&
+                        n_seq == 1 && !is_mem_shared && !chain_heads;
+        if (std::getenv("LLAMA_MTP_REUSE_KV")) {
+            char arch[64] = {};
+            llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+            LOG_INF("MTP_REUSE guard arch=%s n_seq=%u shared=%d chain=%d types=%s qsa=%d lookup=%d\n", arch, n_seq, int(is_mem_shared), int(chain_heads), common_speculative_type_name_str(params.types).c_str(), int(std::getenv("LLAMA_MTP_QSA") != nullptr), int(std::getenv("LLAMA_MTP_LOOKUP_N") != nullptr));
+            if (n_seq != 1 || is_mem_shared || chain_heads || std::strcmp(arch, "qwen4exp") != 0 ||
+                std::count(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != 1 ||
+                !std::all_of(params.types.begin(), params.types.end(), [](common_speculative_type t) {
+                    return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                }) ||
+                std::getenv("LLAMA_MTP_QSA") || std::getenv("LLAMA_MTP_LOOKUP_N")) {
+                throw std::runtime_error("Draft KV reuse requires single-sequence Qwen4exp native MTP with its plain KV cache");
+            }
+            reuse_kv = true;
+            reuse_correct = std::getenv("LLAMA_MTP_REUSE_CORRECT") ? std::atoi(std::getenv("LLAMA_MTP_REUSE_CORRECT")) : 1;
+            if (reuse_correct < 0 || reuse_correct > 16) throw std::runtime_error("Invalid MTP correction span");
+            defer_enabled = true;
+            LOG_INF("MTP_REUSE enabled correction_rows=%d; target verifier unchanged\n", reuse_correct);
+        }
 
+        if (const char * option = std::getenv("LLAMA_MTP_FEEDBACK")) {
+            feedback_mix = std::strtof(option, nullptr);
+            char arch[64] = {};
+            llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+            if (!std::isfinite(feedback_mix) || feedback_mix < 0.0f || feedback_mix > 1.0f ||
+                n_seq != 1 || is_mem_shared || chain_heads || reuse_kv || std::strcmp(arch,"qwen4exp") != 0 ||
+                n_embd%4 != 0 || this->params.n_max > 16) {
+                throw std::runtime_error("MTP feedback requires single-sequence Qwen4exp with bounded draft length and mix");
+            }
+            feedback_enabled = true;
+            feedback_rows.resize(size_t(this->params.n_max+1)*n_embd);
+            feedback_bias.assign(n_embd,0.0f);
+            feedback_adjusted.resize(n_embd);
+            LOG_INF("MTP_FEEDBACK enabled mix=%.3f; request-local normalized residual correction\n", feedback_mix);
+        }
+
+        if(const char * path=std::getenv("LLAMA_H90_ALIGNMENT")) {
+            char arch[64]={};llama_model_meta_val_str(llama_get_model(ctx_dft),"general.architecture",arch,sizeof(arch));
+            h90_alignment_mix=std::getenv("LLAMA_H90_ALIGNMENT_MIX")?std::strtof(std::getenv("LLAMA_H90_ALIGNMENT_MIX"),nullptr):1.0f;
+            if(n_seq!=1 || n_embd!=10240 || std::strcmp(arch,"qwen4exp") || chain_heads || is_mem_shared ||
+               !std::isfinite(h90_alignment_mix) || h90_alignment_mix<0 || h90_alignment_mix>1 || feedback_mix>0)
+                throw std::runtime_error("Alignment requires bounded single-sequence native Qwen4exp MTP");
+            FILE * f=std::fopen(path,"rb");if(!f)throw std::runtime_error("Cannot open draft alignment weights");
+            h90_alignment.resize(size_t(4)*5*(n_embd/4));h90_aligned.resize(n_embd);
+            const size_t got=std::fread(h90_alignment.data(),sizeof(float),h90_alignment.size(),f);
+            const int extra=std::fgetc(f);std::fclose(f);
+            if(got!=h90_alignment.size() || extra!=EOF || !std::all_of(h90_alignment.begin(),h90_alignment.end(),[](float x){return std::isfinite(x);}))
+                throw std::runtime_error("Invalid draft alignment matrix file");
+            LOG_INF("H90_ALIGNMENT loaded bytes=%zu mix=%.3f; target verifier unchanged\n",h90_alignment.size()*sizeof(float),h90_alignment_mix);
+        }
+        if(const char * value=std::getenv("LLAMA_MTP_TARGET_VOCAB")) {
+            vocab_cap=std::atoi(value);
+            char arch[64]={};llama_model_meta_val_str(llama_get_model(ctx_dft),"general.architecture",arch,sizeof(arch));
+            if(vocab_cap<1024 || vocab_cap>65536 || n_seq!=1 || std::strcmp(arch,"qwen4exp") ||
+               is_mem_shared || chain_heads || reuse_kv || defer_enabled || std::getenv("LLAMA_MTP_LOW_RANK")) {
+                throw std::runtime_error("Target-informed vocabulary requires plain single-sequence Qwen4exp MTP");
+            }
+            vocab_base=std::getenv("LLAMA_MTP_VOCAB_BASE") ? std::atoi(std::getenv("LLAMA_MTP_VOCAB_BASE")) : 4096;
+            vocab_margin=std::getenv("LLAMA_MTP_VOCAB_MARGIN") ? std::strtof(std::getenv("LLAMA_MTP_VOCAB_MARGIN"),nullptr) : 12.0f;
+            if(vocab_base<0 || vocab_base>vocab_cap || !std::isfinite(vocab_margin) || vocab_margin<=0 || vocab_margin>32)
+                throw std::runtime_error("Invalid dynamic vocabulary bounds");
+            LOG_INF("MTP_TARGET_VOCAB cap=%d margin=%.1f request_local=1\n",vocab_cap,vocab_margin);
+        }
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
@@ -1438,6 +1721,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if(h90_suffix_mix>0 || h90_phase) LOG_INF("H90_PHASE_SUFFIX mix=%.3f hits=%llu cached=%llu think_rounds=%llu answer_rounds=%llu\n",h90_suffix_mix,(unsigned long long)h90_suffix_hits,(unsigned long long)h90_suffix_cached,(unsigned long long)h90_think_rounds,(unsigned long long)h90_answer_rounds);
+        if(h90_bias_mode)LOG_INF("H90_TOKEN_BIAS mode=%d updates=%llu contexts=%zu request_local=1\n",h90_bias_mode,(unsigned long long)h90_bias_updates,h90_bias_table.size());
+        if(h90_alignment_calls)LOG_INF("H90_ALIGNMENT calls=%llu\n",(unsigned long long)h90_alignment_calls);
+        if(h90_telemetry) for(int k=1;k<=8;++k) if(h90_visits[k] || h90_reached[k])
+            LOG_INF("H90_WIDTH k=%d rounds=%llu tokens=%.3f time_us=%.3f reached=%llu accepted=%llu\n",
+                k,(unsigned long long)h90_visits[k],h90_tokens[k],h90_time_us[k],
+                (unsigned long long)h90_reached[k],(unsigned long long)h90_accepted[k]);
+
+        if(r95_width_gate>=0)LOG_INF("R95_WIDTH_GATE threshold=%.3f n5=%llu n7=%llu\n",r95_width_gate,(unsigned long long)r95_short_rounds,(unsigned long long)r95_long_rounds);
+        if(r95_argmax_mode) LOG_INF("R95_ARGMAX checks=%llu\n",(unsigned long long)r95_argmax_checks);
+        if(vocab_cap) LOG_INF("MTP_TARGET_VOCAB updates=%llu\n",(unsigned long long)vocab_updates);
+        if (lookup_rounds) {
+            fprintf(stderr, "MTP_LOOKUP rounds=%llu proposals=%llu accepted=%llu\n",
+                    (unsigned long long)lookup_rounds, (unsigned long long)lookup_tokens,
+                    (unsigned long long)lookup_accepted);
+        }
+        if (defer_enabled) {
+            LOG_INF("MTP_DEFER rounds=%llu prefix_rows=%llu\n",
+                    (unsigned long long) deferred_rounds, (unsigned long long) deferred_rows_used);
+        }
+        if (feedback_enabled) LOG_INF("MTP_FEEDBACK verified_rows=%llu normalized_cosine=%.6f\n",
+                (unsigned long long)feedback_total,feedback_cosine_sum/std::max<double>(1.0,4.0*feedback_total));
+        if (reuse_kv) LOG_INF("MTP_REUSE rounds=%llu cached_rows_preserved=%llu\n",
+                (unsigned long long) reuse_rounds, (unsigned long long) reuse_rows_saved);
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1458,6 +1765,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        h90_thinking=true;h90_previous_suffix.clear();h90_verify_positions.clear();h90_verify_indices.clear();h90_verify_tokens.clear();h90_suffix_hits=h90_suffix_cached=h90_think_rounds=h90_answer_rounds=0;
+        h90_draft_rng.seed(0x98523178u);h90_draft_probabilities.clear();
+        h90_bias_table.clear();h90_bias_keys.clear();h90_bias_ids.clear();h90_bias_updates=0;
+        h90_round=0;h90_start_us=0;h90_proposals=0;h90_width=3;
+        for(int j=0;j<9;++j){h90_tokens[j]=0;h90_time_us[j]=0;h90_visits[j]=0;h90_reached[j]=0;h90_accepted[j]=0;}
+
+        defer_next_process = false;
+        deferred_tokens.clear();
+        feedback_seen = 0;
+        feedback_count = 0;
+        if(vocab_cap) {
+            vocab_last_row=-1;vocab_recent.clear();vocab_prompt=prompt;
+            llama_set_draft_vocab(params.ctx_dft,nullptr,0);
+        }
+        if (feedback_enabled) std::fill(feedback_bias.begin(),feedback_bias.end(),0.0f);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1486,6 +1808,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+        if(h90_suffix_mix>0 || h90_phase) {
+            h90_verify_positions.clear();h90_verify_indices.clear();h90_verify_tokens.clear();
+            if(n_tokens<=16 && batch_in.pos && batch_in.logits && batch_in.n_seq_id && batch_in.seq_id) {
+                for(int j=0;j<n_tokens;++j) if(batch_in.n_seq_id[j]==1 && batch_in.seq_id[j][0]==0 && batch_in.logits[j]) {
+                    h90_verify_positions.push_back(batch_in.pos[j]);h90_verify_indices.push_back(j);h90_verify_tokens.push_back(batch_in.token[j]);
+                }
+            }
+        }
+
+        const bool postpone = defer_enabled && defer_next_process &&
+                              n_tokens <= params.n_max + 1 && batch_in.pos[0] == deferred_from;
+        defer_next_process = false;
 
         // remember the frist and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -1540,7 +1874,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
+            if (postpone) {
+                deferred_tokens.assign(batch_in.token, batch_in.token + n_tokens);
+                deferred_positions.assign(batch_in.pos, batch_in.pos + n_tokens);
+                deferred_inputs.assign(batch.embd, batch.embd + (size_t) n_tokens * n_embd);
+                ++deferred_rounds;
+            } else {
+            deferred_tokens.clear();
             auto * mem_dft = llama_get_memory(ctx_dft);
+            if (reuse_kv && llama_memory_seq_pos_max(mem_dft, 0) >= batch_in.pos[0] &&
+                !llama_memory_seq_rm(mem_dft, 0, batch_in.pos[0], -1)) {
+                GGML_ABORT("Draft KV reuse fallback rewind failed");
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
@@ -1570,6 +1915,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1594,7 +1940,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        h90_draft_probabilities.clear();
+        if(h90_telemetry) {
+            h90_start_us=ggml_time_us();h90_proposals=0;
+            h90_width=params.n_max;
+            if(h90_adaptive) {
+                const int arms[4]={3,2,4,5};
+                if(h90_round<16) h90_width=arms[h90_round/4];
+                else if(h90_round%32<2) h90_width=arms[(h90_round/32)%4];
+                else {
+                    double best=-1;
+                    for(int k:arms) if(h90_time_us[k]>0) {
+                        const double score=h90_tokens[k]/h90_time_us[k];
+                        if(score>best){best=score;h90_width=k;}
+                    }
+                }
+            }
+        }
+
+        if(h90_phase) {
+            if(!dparams.empty() && dparams[0].drafting && dparams[0].id_last==h90_think_end) h90_thinking=false;
+            h90_width=h90_thinking?3:5;
+            if(h90_thinking) ++h90_think_rounds;else ++h90_answer_rounds;
+        }
         auto & ctx_dft = params.ctx_dft;
+        r95_previous_confidence=1.0f;
+        feedback_count = 0;
 
         common_batch_clear(batch);
 
@@ -1611,10 +1982,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if(h90_bias_mode) {
+                h90_bias_ids.clear();h90_bias_keys.clear();
+                h90_bias_prev1=uint64_t(uint32_t(dp.id_last))+1;
+                h90_bias_prev2=dp.prompt && !dp.prompt->empty() ? uint64_t(uint32_t(dp.prompt->back()))+1 : 0;
+            }
+            lookup_active = false;
+            if (vocab_cap) update_target_vocab();
+            if (history_proposal(dp)) continue;
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            if (defer_enabled && !deferred_tokens.empty()) {
+                GGML_ASSERT(seq_id == 0);
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                if (!llama_memory_seq_rm(mem_dft, seq_id, deferred_positions.front(), -1)) {
+                    GGML_ABORT("MTP deferred prefix rewind failed");
+                }
+                for (size_t j = 0; j < deferred_tokens.size() && deferred_positions[j] < dp.n_past; ++j) {
+                    common_batch_add(batch, deferred_tokens[j], deferred_positions[j], { seq_id }, false);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                                deferred_inputs.data() + j * n_embd, row_bytes);
+                    ++deferred_rows_used;
+                }
+                deferred_tokens.clear();
+            }
+            if (defer_enabled) {
+                defer_next_process = true;
+                deferred_from = dp.n_past;
+            }
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
@@ -1662,10 +2059,81 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                h90_restore_logits h90_bias_guard;
+                if(h90_bias_mode) {
+                    const auto found=h90_bias_table.find(h90_bias_key());
+                    if(found!=h90_bias_table.end()) {
+                        h90_bias_guard.values=llama_get_logits_ith(ctx_dft,i_last[seq_id]);
+                        const int nv=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                        for(const auto & item:found->second) if(item.first>=0 && item.first<nv && std::isfinite(h90_bias_guard.values[item.first])) {
+                            h90_bias_guard.original.emplace_back(item.first,h90_bias_guard.values[item.first]);
+                            h90_bias_guard.values[item.first]+=item.second;
+                        }
+                    }
+                }
+                llama_token_data direct_data{};
+                llama_token_data_array direct_candidates{};
+                llama_token direct_id=LLAMA_TOKEN_NULL;
+                if (r95_argmax_mode>=2) {
+                    const int nv=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    direct_id=r95_unique_argmax(llama_get_logits_ith(ctx_dft,i_last[seq_id]),nv);
+                }
+                const bool use_direct=r95_argmax_mode==2 && direct_id!=LLAMA_TOKEN_NULL;
+                if(use_direct) {
+                    direct_data.id=direct_id; direct_data.p=1.0f;
+                    direct_candidates.data=&direct_data; direct_candidates.size=1;
+                    direct_candidates.selected=0; direct_candidates.sorted=true;
+                } else {
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                }
+                h90_bias_guard.restore();
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                if (feedback_enabled && seq_id == 0 && i <= params.n_max) {
+                    std::memcpy(feedback_rows.data()+size_t(i)*n_embd,h_row,row_bytes);
+                    feedback_count = i+1;
+                    if (feedback_mix > 0.0f && feedback_seen >= 8) {
+                        const int width=n_embd/4;
+                        for (int stream=0;stream<4;++stream) {
+                            const float * raw=h_row+stream*width;
+                            const float * bias=feedback_bias.data()+stream*width;
+                            float * adjusted=feedback_adjusted.data()+stream*width;
+                            float h2=0.0f,b2=0.0f;
+                            for (int j=0;j<width;++j) { h2+=raw[j]*raw[j];b2+=bias[j]*bias[j]; }
+                            const float rms=std::sqrt(h2/width+1e-6f);
+                            const float amount=std::min(feedback_mix,0.25f/std::sqrt(b2/width+1e-12f))*rms;
+                            for (int j=0;j<width;++j) adjusted[j]=raw[j]+amount*bias[j];
+                        }
+                        h_row=feedback_adjusted.data();
+                    }
+                }
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                if(!h90_alignment.empty() && h90_alignment_mix>0) {
+                    const int width=n_embd/4;
+                    float inv[4],rms[4];
+                    for(int s=0;s<4;++s) {
+                        const float * x=h_row+s*width;
+                        float a0=0,a1=0,a2=0,a3=0;
+                        for(int j=0;j<width;j+=4){a0+=x[j]*x[j];a1+=x[j+1]*x[j+1];a2+=x[j+2]*x[j+2];a3+=x[j+3]*x[j+3];}
+                        rms[s]=std::sqrt(((a0+a1)+(a2+a3))/width+1e-6f);inv[s]=1.0f/rms[s];
+                    }
+                    for(int out=0;out<4;++out) {
+                        const float * w=h90_alignment.data()+size_t(out)*5*width;
+                        float * y=h90_aligned.data()+out*width;
+                        const float blend=h90_alignment_mix;
+                        for(int j=0;j<width;++j) {
+                            const float mapped=w[4*width+j]+w[j]*h_row[j]*inv[0]+w[width+j]*h_row[width+j]*inv[1]+
+                                w[2*width+j]*h_row[2*width+j]*inv[2]+w[3*width+j]*h_row[3*width+j]*inv[3];
+                            y[j]=((1.0f-blend)*h_row[out*width+j]*inv[out]+blend*mapped)*rms[out];
+                        }
+                    }
+                    h_row=h90_aligned.data();++h90_alignment_calls;
+                }
+
+                const auto * cur_p = use_direct ? &direct_candidates : common_sampler_get_candidates(smpl, true);
+                if(r95_argmax_mode==3 && direct_id!=LLAMA_TOKEN_NULL) {
+                    GGML_ASSERT(direct_id==cur_p->data[0].id);
+                    ++r95_argmax_checks;
+                }
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -1674,7 +2142,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
+                if(h90_rejection) {
+                    h90_distribution q;q.reserve(cur_p->size);
+                    for(size_t j=0;j<cur_p->size;++j)if(cur_p->data[j].p>0)q.push_back({cur_p->data[j].id,double(cur_p->data[j].p)});
+                    q=h90_normalize(std::move(q));
+                    if(h90_suffix_mix>0) {
+                        // Match absolute positions in the previous abandoned branch.
+                        // These cached probabilities only modify q; p is still fully evaluated.
+                        const auto found=h90_previous_suffix.find(dparams[seq_id].n_past+i+1);
+                        if(found!=h90_previous_suffix.end()) {
+                            std::map<llama_token,double> mixed;
+                            for(const auto & x:q) mixed[x.id]+=(1-h90_suffix_mix)*x.p;
+                            for(const auto & x:found->second) mixed[x.id]+=h90_suffix_mix*x.p;
+                            q.clear();for(const auto & x:mixed) if(x.second>0) q.push_back({x.first,x.second});
+                            q=h90_normalize(std::move(q));++h90_suffix_hits;
+                        }
+                    }
+
+                    id=h90_categorical(q,std::generate_canonical<double,53>(h90_draft_rng));
+                    h90_draft_probabilities.push_back({id,std::move(q)});
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1689,9 +2177,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
+                if(h90_bias_mode) {
+                    h90_bias_keys.push_back(h90_bias_key());h90_bias_ids.push_back(id);
+                    h90_bias_prev2=h90_bias_prev1;h90_bias_prev1=uint64_t(uint32_t(id))+1;
+                }
                 result.push_back(id);
+                if(h90_telemetry && seq_id==0) h90_proposals=int(result.size());
 
-                if (params.n_max <= (int) result.size()) {
+                const bool gate_stop = r95_width_gate>=0.0f && result.size()==5 &&
+                                       r95_previous_confidence*cur_p->data[0].p < r95_width_gate;
+                r95_previous_confidence=cur_p->data[0].p;
+                if (params.n_max <= (int) result.size() || gate_stop || ((h90_adaptive || h90_phase) && h90_width <= (int) result.size())) {
+                    if(r95_width_gate>=0) {if(gate_stop)++r95_short_rounds;else ++r95_long_rounds;}
+
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1745,10 +2243,112 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if(seq_id==0 && (h90_suffix_mix>0 || h90_phase)) {
+            const size_t committed=std::min<size_t>(size_t(n_accepted)+1,h90_verify_tokens.size());
+            if(h90_phase) for(size_t j=0;j<committed;++j) if(h90_verify_tokens[j]==h90_think_end) h90_thinking=false;
+            h90_previous_suffix.clear();
+            if(h90_suffix_mix>0) {
+                const int nv=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_tgt)));
+                for(size_t j=committed;j<h90_verify_indices.size();++j) {
+                    const float * logits=llama_get_logits_ith(params.ctx_tgt,h90_verify_indices[j]);
+                    if(!logits) throw std::runtime_error("Missing target suffix output");
+                    h90_previous_suffix.emplace(h90_verify_positions[j]+1,h90_teacher_proposal(logits,nv));++h90_suffix_cached;
+                }
+            }
+        }
+
+        if(h90_telemetry && seq_id==0 && h90_start_us && h90_proposals>0) {
+            const int width=std::clamp(h90_width,1,8);
+            const double dt=double(ggml_time_us()-h90_start_us);
+            if(dt>0 && dt<1e7) {
+                h90_tokens[width]+=double(n_accepted)+1;
+                h90_time_us[width]+=dt;
+                ++h90_visits[width];
+                for(int i=1;i<=std::min<int>(h90_proposals,int(n_accepted)+1) && i<=8;++i) {
+                    ++h90_reached[i];
+                    h90_accepted[i]+=(i<=n_accepted);
+                }
+            }
+            ++h90_round;h90_start_us=0;
+        }
+
+        if(h90_bias_mode && seq_id==0 && size_t(n_accepted)<h90_bias_ids.size()) {
+            // Only the first rejected proposal has a verified matching prefix.
+            const float * logits=llama_get_logits_ith(params.ctx_tgt,n_accepted);
+            const int nv=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_tgt)));
+            const llama_token truth=r95_unique_argmax(logits,nv);
+            const llama_token wrong=h90_bias_ids[n_accepted];
+            const uint64_t key=h90_bias_keys[n_accepted];
+            if(truth!=LLAMA_TOKEN_NULL && truth!=wrong && (h90_bias_table.size()<4096 || h90_bias_table.count(key))) {
+                auto & row=h90_bias_table[key];
+                const size_t cap=h90_bias_mode==1 ? 1024 : 64;
+                if(row.size()+2<=cap || (row.count(truth) && row.count(wrong))) {
+                    for(auto & item:row)item.second*=0.99f;
+                    row[truth]=std::clamp(row[truth]+h90_bias_eta,-2.0f,2.0f);
+                    row[wrong]=std::clamp(row[wrong]-h90_bias_eta,-2.0f,2.0f);
+                    ++h90_bias_updates;
+                }
+            }
+        }
+        if(vocab_cap && seq_id==0) vocab_last_row=n_accepted;
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
+        if (reuse_kv && !deferred_tokens.empty()) {
+            // The target has verified every proposal. Only the draft cache is
+            // approximate; accepted draft rows can stay resident until corrected.
+            const size_t keep = std::min<size_t>(size_t(n_accepted) + 1, deferred_tokens.size());
+            auto * memory = llama_get_memory(params.ctx_dft);
+            const llama_pos base = deferred_positions.front();
+            const llama_pos cached = llama_memory_seq_pos_max(memory, seq_id);
+            const size_t missing = size_t(std::clamp<int64_t>(int64_t(cached) - base + 1, 0, int64_t(keep)));
+            const size_t corrected = reuse_correct == 0 ? keep : (keep > size_t(reuse_correct) ? keep - reuse_correct : 0);
+            const size_t first = std::min(missing, corrected);
+            if (!llama_memory_seq_rm(memory, seq_id, base + llama_pos(first), -1)) {
+                GGML_ABORT("Draft KV reuse suffix removal failed");
+            }
+            reuse_rows_saved += first;
+            ++reuse_rounds;
+            deferred_tokens.resize(keep);
+            deferred_positions.resize(keep);
+            deferred_inputs.resize(keep * size_t(n_embd));
+            deferred_tokens.erase(deferred_tokens.begin(), deferred_tokens.begin() + first);
+            deferred_positions.erase(deferred_positions.begin(), deferred_positions.begin() + first);
+            deferred_inputs.erase(deferred_inputs.begin(), deferred_inputs.begin() + first * size_t(n_embd));
+        }
+
+        if (feedback_enabled && seq_id == 0) {
+            // Supervision is restricted to positions already verified on the
+            // accepted prefix. The correction is discarded at every request.
+            const int rows=std::min({int(n_accepted)+1,feedback_count,verify_h_rows[0]});
+            const int width=n_embd/4;
+            if(const char * path=std::getenv("LLAMA_H90_PAIR_CAPTURE")) {
+                FILE * f=std::fopen(path,"ab");if(!f)throw std::runtime_error("Cannot open explicit alignment calibration output");
+                bool ok=true;
+                for(int i=0;i<rows;++i) {
+                    const float depth=float(i);
+                    ok=ok && std::fwrite(&depth,sizeof(float),1,f)==1;
+                    ok=ok && std::fwrite(feedback_rows.data()+size_t(i)*n_embd,sizeof(float),n_embd,f)==size_t(n_embd);
+                    ok=ok && std::fwrite(verify_h[0].data()+size_t(i)*n_embd,sizeof(float),n_embd,f)==size_t(n_embd);
+                }
+                if(std::fclose(f)!=0 || !ok)throw std::runtime_error("Alignment calibration write failed");
+            }
+            for (int i=0;i<rows;++i) {
+                for (int stream=0;stream<4;++stream) {
+                    const float * pred=feedback_rows.data()+size_t(i)*n_embd+stream*width;
+                    const float * truth=verify_h[0].data()+size_t(i)*n_embd+stream*width;
+                    float * bias=feedback_bias.data()+stream*width;
+                    float p2=0.0f,t2=0.0f,pt=0.0f;
+                    for (int j=0;j<width;++j) {p2+=pred[j]*pred[j];t2+=truth[j]*truth[j];pt+=pred[j]*truth[j];}
+                    const float pi=1.0f/std::sqrt(p2/width+1e-6f),ti=1.0f/std::sqrt(t2/width+1e-6f);
+                    for (int j=0;j<width;++j) bias[j]=0.95f*bias[j]+0.05f*(truth[j]*ti-pred[j]*pi);
+                    feedback_cosine_sum += double(pt)/std::sqrt(double(p2)*t2+1e-12);
+                }
+                ++feedback_seen;++feedback_total;
+            }
+        }
+        if (lookup_active && seq_id == 0) lookup_accepted += n_accepted;
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
             return;
@@ -1910,6 +2510,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        if (std::getenv("LLAMA_NGRAM_REQUEST_LOCAL") && n_seq == 1) {
+            // Benchmark isolation and request-local retrieval: never seed drafts
+            // with generated answers from an earlier request.
+            mod.reset();
+            sinfo.n_low = 0;
+        }
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -2452,6 +3058,11 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
     return rates;
 }
 
+const std::vector<h90_draft_step> * common_speculative_get_h90_probs(const common_speculative * spec, llama_seq_id seq) {
+    if(!spec || seq<0 || size_t(seq)>=spec->impl_last.size() || !spec->impl_last[seq])return nullptr;
+    return spec->impl_last[seq]->h90_probabilities(seq);
+}
+
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec) {
     GGML_ASSERT(spec);
     return spec->synth_probs;
@@ -2552,6 +3163,8 @@ common_speculative_init_result::common_speculative_init_result(
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        mparams.model_shared = model_tgt;
 
         llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
         if (model_dft == NULL) {

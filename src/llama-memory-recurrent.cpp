@@ -192,6 +192,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const bool has_state = std::any_of(r_l.begin(), r_l.end(), [](auto * t) { return t != nullptr; }) ||
+                                       std::any_of(s_l.begin(), s_l.end(), [](auto * t) { return t != nullptr; }) ||
+                                       std::any_of(p_l.begin(), p_l.end(), [](auto * t) { return t != nullptr; });
+                if (!has_state) {
+                    // The indexed-attention-only memory wrapper has positions, with no recurrent state to restore.
+                    cell.pos = p0 - 1;
+                    set_rs_idx(seq_id, 0);
+                    return true;
+                }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;

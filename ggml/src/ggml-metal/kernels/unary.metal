@@ -20,7 +20,11 @@ kernel void kernel_unary_impl(
     int i0;
 
     if (FC_CNT) {
-        i0 = tgpig.x;
+        i0 = tgpig.x*ntg.x + tpitg.x;
+        const int64_t count = int64_t(args.ne0)*args.ne1*args.ne2*args.ne3;
+        if (int64_t(i0) >= count) {
+            return;
+        }
 
         src0_ptr = (device const T0 *) (src0);
         dst_ptr  = (device       T  *) (dst);
@@ -49,6 +53,11 @@ kernel void kernel_unary_impl(
 
         if (FC_OP == OP_UNARY_NUM_SCALE) {
             dst_ptr[i0] = (T) (args.scale * x + args.bias);
+        }
+
+        if (FC_OP == OP_UNARY_NUM_SCALE_SILU) {
+            const TC scaled = args.scale * x + args.bias;
+            dst_ptr[i0] = (T) (scaled / (1 + exp(-scaled)));
         }
 
         if (FC_OP == OP_UNARY_NUM_FILL) {

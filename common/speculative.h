@@ -1,4 +1,5 @@
 #pragma once
+#include "h90-rejection.h"
 
 #include "llama.h"
 #include "common.h"
@@ -113,3 +114,5 @@ private:
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
+const std::vector<h90_draft_step> * common_speculative_get_h90_probs(const common_speculative * spec, llama_seq_id seq_id);

@@ -80,6 +80,30 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_qwen4exp_hc_reduce_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QWEN4EXP_HC_REDUCE,
+    /*.name             =*/ "fused Qwen4-Exp HC reduce",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_qwen4exp_hc_combine_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QWEN4EXP_HC_COMBINE,
+    /*.name             =*/ "fused Qwen4-Exp HC combine",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_qsa_block_score_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QSA_BLOCK_SCORE,
+    /*.name             =*/ "QSA block score",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_qsa_attn_probe = {
+    /*.op               =*/ LLM_FUSED_OP_QSA_ATTN,
+    /*.name             =*/ "indexed QSA attention",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -139,6 +163,30 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (getenv("LLAMA_LAB_ROUTE_STATS") && model.arch == LLM_ARCH_QWEN4EXP &&
+        params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && !cparams.cb_eval) {
+        cparams.cb_eval = [](ggml_tensor * t, bool ask, void *) -> bool {
+            static int captured = 0;
+            const bool wanted = captured < 768 && t->type == GGML_TYPE_I32 &&
+                t->ne[0] == 10 && t->ne[1] >= 2 && t->ne[1] <= 8 &&
+                std::strncmp(t->name, "ffn_moe_topk-", 13) == 0;
+            if (ask) return wanted;
+            if (!wanted) return true;
+            std::vector<uint8_t> data(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, data.data(), 0, data.size());
+            fprintf(stderr, "ROUTE_IDS %s %lld", t->name, (long long)t->ne[1]);
+            for (int64_t c=0; c<t->ne[1]; ++c) {
+                for (int64_t r=0; r<t->ne[0]; ++r) {
+                    int32_t id;
+                    std::memcpy(&id, data.data()+c*t->nb[1]+r*t->nb[0], sizeof(id));
+                    fprintf(stderr, " %d", id);
+                }
+            }
+            fprintf(stderr, "\n");
+            ++captured;
+            return true;
+        };
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -239,7 +287,14 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
+    cparams.fused_qwen4exp_hc_reduce = true;
+    cparams.fused_qwen4exp_hc_combine = true;
     cparams.auto_fhc           = true;
+
+    cparams.fused_qsa_block_score = true;
+    cparams.auto_fqsa_block_score  = true;
+    cparams.fused_qsa_attn = true;
+    cparams.auto_fqsa_attn  = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -499,6 +554,8 @@ llama_context::~llama_context() {
             }
         }
     }
+    if(h90_shape_switches) LLAMA_LOG_INFO("H90_SHAPE_BANK switches=%llu slots=%zu\n",(unsigned long long)h90_shape_switches,h90_shape_bank.size());
+    h90_shape_bank.clear();
     ggml_opt_free(opt_ctx);
 }
 
@@ -571,11 +628,25 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 
     if (cparams.auto_fhc) {
-        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+        LLAMA_LOG_INFO("%s: resolving fused hyper-connection support:\n", func);
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        resolve(llm_fused_op_qwen4exp_hc_reduce_probe, cparams.fused_qwen4exp_hc_reduce);
+        resolve(llm_fused_op_qwen4exp_hc_combine_probe, cparams.fused_qwen4exp_hc_combine);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_fqsa_block_score) {
+        LLAMA_LOG_INFO("%s: resolving QSA block score support:\n", func);
+        resolve(llm_fused_op_qsa_block_score_probe, cparams.fused_qsa_block_score);
+        cparams.auto_fqsa_block_score = false;
+    }
+
+    if (cparams.auto_fqsa_attn) {
+        LLAMA_LOG_INFO("%s: resolving indexed QSA attention support:\n", func);
+        resolve(llm_fused_op_qsa_attn_probe, cparams.fused_qsa_attn);
+        cparams.auto_fqsa_attn = false;
     }
 }
 
@@ -599,6 +670,8 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+    h90_shape_bank.clear();
+    h90_active_shape = 0;
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
@@ -1168,6 +1241,20 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_draft_vocab(const llama_token * tokens, size_t count) {
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || model.arch != LLM_ARCH_QWEN4EXP ||
+        count > 65536 || (count && !tokens)) throw std::runtime_error("Invalid MTP dynamic vocabulary request");
+    if (count) {
+        for (size_t i=0;i<count;++i) {
+            if (tokens[i]<0 || tokens[i]>=int32_t(model.vocab.n_tokens()) || (i && tokens[i]<=tokens[i-1]))
+                throw std::runtime_error("Draft candidate IDs must be strictly sorted and in range");
+        }
+    }
+    if (count != draft_vocab.size()) sched_need_reserve = true;
+    if (count) draft_vocab.assign(tokens,tokens+count);
+    else draft_vocab.clear();
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -1332,18 +1419,62 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    struct r95_host_profile {
+        int64_t x[2][17][8]={};
+        ~r95_host_profile() {
+            for(int m=0;m<2;++m)for(int n=1;n<=16;++n)if(x[m][n][0])
+                fprintf(stderr,"R95_HOST mtp=%d n=%d calls=%lld builds=%lld apply_us=%lld build_us=%lld alloc_us=%lld inputs_us=%lld submit_us=%lld total_us=%lld\n",m,n,
+                (long long)x[m][n][0],(long long)x[m][n][1],(long long)x[m][n][2],(long long)x[m][n][3],
+                (long long)x[m][n][4],(long long)x[m][n][5],(long long)x[m][n][6],(long long)x[m][n][7]);
+        }
+    };
+    static r95_host_profile r95_profile;
+    static const bool r95_enable=std::getenv("LLAMA_R95_HOST_PROFILE")!=nullptr;
+    const bool r95_on=r95_enable && ubatch.n_tokens<=16;
+    int64_t * r95_s=r95_profile.x[gtype==LLM_GRAPH_TYPE_DECODER_MTP][std::min<int>(16,ubatch.n_tokens)];
+    const int64_t r95_start=r95_on?ggml_time_us():0;
+    int64_t r95_mark=r95_start;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
+    static const int h90_bank_mode = std::getenv("LLAMA_H90_SHAPE_BANK") ? std::atoi(std::getenv("LLAMA_H90_SHAPE_BANK")) : 0;
+    const bool h90_bank_enabled = h90_bank_mode >= 1 && h90_bank_mode <= 2 &&
+        model.arch == LLM_ARCH_QWEN4EXP && cparams.n_seq_max == 1 &&
+        !cparams.pipeline_parallel && !graph_reuse_disable && !opt_ctx &&
+        (h90_bank_mode == 2 || gtype != LLM_GRAPH_TYPE_DECODER_MTP);
+    if (h90_bank_enabled) {
+        const uint32_t key = ubatch.n_tokens > 0 && ubatch.n_tokens <= 8 ? ubatch.n_tokens : 0;
+        if (key != h90_active_shape) {
+            // Complete every use of the outgoing input/scratch allocations.
+            ggml_backend_sched_synchronize(sched.get());
+            auto & outgoing = h90_shape_bank[h90_active_shape];
+            outgoing.scheduler = std::move(sched);
+            outgoing.graph = std::move(gf_res_prev);
+            auto & incoming = h90_shape_bank[key];
+            if (!incoming.scheduler) {
+                const size_t capacity = graph_max_nodes(std::min(cparams.n_ctx,cparams.n_ubatch));
+                incoming.scheduler.reset(ggml_backend_sched_new(backend_ptrs.data(),backend_buft.data(),backend_ptrs.size(),capacity,false,cparams.op_offload));
+                if (!incoming.scheduler) throw std::runtime_error("shape-bank scheduler allocation failed");
+                incoming.graph.reset(new llm_graph_result(capacity));
+            }
+            sched = std::move(incoming.scheduler);
+            gf_res_prev = std::move(incoming.graph);
+            h90_active_shape = key;
+            ++h90_shape_switches;
+        }
+    }
+    if(r95_on){r95_s[2]+=ggml_time_us()-r95_mark;}
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    if(r95_on && gtype!=LLM_GRAPH_TYPE_DECODER_MTP) fprintf(stderr,"R95_DISABLE reuse_disabled=%d n=%u\n",int(graph_reuse_disable),ubatch.n_tokens);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1364,7 +1495,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        if(r95_on) r95_mark=ggml_time_us();
         gf = model.build_graph(gparams);
+        if(r95_on){r95_s[1]++;r95_s[3]+=ggml_time_us()-r95_mark;}
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1374,11 +1507,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if(r95_on) r95_mark=ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if(r95_on)r95_s[4]+=ggml_time_us()-r95_mark;
     }
 
     // set the input data for the input tensors
@@ -1386,18 +1521,72 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        if(r95_on)r95_mark=ggml_time_us();
         res->set_inputs(&ubatch);
+        if(r95_on)r95_s[5]+=ggml_time_us()-r95_mark;
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if(r95_on)r95_mark=ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if(r95_on)r95_s[6]+=ggml_time_us()-r95_mark;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
 
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && ubatch.n_tokens == 1) {
+        if (const char * path = std::getenv("LLAMA_MTP_HEAD_CAPTURE")) {
+            if (auto * feature = ggml_graph_get_tensor(res->get_gf(),"lab_mtp_head_feature")) {
+                GGML_ASSERT(feature->type==GGML_TYPE_F32 && ggml_is_contiguous(feature));
+                ggml_backend_sched_synchronize(sched.get());
+                std::vector<float> values(ggml_nelements(feature));
+                ggml_backend_tensor_get(feature,values.data(),0,ggml_nbytes(feature));
+                FILE * file=std::fopen(path,"ab");
+                if (!file) throw std::runtime_error("Failed to open explicit draft-head calibration output");
+                const size_t count=std::fwrite(values.data(),sizeof(float),values.size(),file);
+                const int closed=std::fclose(file);
+                if (count!=values.size() || closed!=0) throw std::runtime_error("Failed to persist draft-head calibration features");
+            }
+        }
+    }
+
+    if (std::getenv("LLAMA_QSA_AUDIT_KEYS") && ubatch.n_tokens <= 16 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        auto * mask = ggml_graph_get_tensor(res->get_gf(), "r95_qsa_audit_mask");
+        if (mask) {
+            ggml_backend_sched_synchronize(sched.get());
+            std::vector<float> masks(ggml_nelements(mask));
+            ggml_backend_tensor_get(mask, masks.data(), 0, ggml_nbytes(mask));
+            const int64_t nb = mask->ne[0];
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                char name[64]; std::snprintf(name, sizeof(name), "r95_qsa_delta_%u", il);
+                auto * delta = ggml_graph_get_tensor(res->get_gf(), name);
+                if (!delta) continue;
+                std::snprintf(name, sizeof(name), "r95_qsa_ref_%u", il);
+                auto * reference = ggml_graph_get_tensor(res->get_gf(), name);
+                std::vector<float> d(ggml_nelements(delta)), ref(d.size());
+                ggml_backend_tensor_get(delta, d.data(), 0, ggml_nbytes(delta));
+                ggml_backend_tensor_get(reference, ref.data(), 0, ggml_nbytes(reference));
+                double se=0, sr=0; float max_abs=0; size_t changed=0, count=0;
+                for (int64_t b=0; b<nb; ++b) {
+                    bool visible=false;
+                    for (int64_t q=0; q<mask->ne[1]; ++q) visible |= masks[q*nb+b]==0.0f;
+                    if (!visible) continue;
+                    for (int64_t j=0; j<delta->ne[0]; ++j) {
+                        const size_t k=size_t(b)*delta->ne[0]+j;
+                        GGML_ASSERT(std::isfinite(d[k]) && std::isfinite(ref[k]));
+                        max_abs=std::max(max_abs,std::fabs(d[k])); se+=double(d[k])*d[k];sr+=double(ref[k])*ref[k];
+                        changed+=d[k]!=0.0f; ++count;
+                    }
+                }
+                fprintf(stderr,"QSA_KEY_AUDIT layer=%u pos=%d tokens=%u count=%zu changed=%zu max_abs=%.9g relative_rmse=%.9g\n",
+                    il,int(ubatch.pos[0]),ubatch.n_tokens,count,changed,double(max_abs),std::sqrt(se/std::max(sr,1e-30)));
+            }
+        }
+    }
+    if(r95_on){r95_s[0]++;r95_s[7]+=ggml_time_us()-r95_start;}
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2486,6 +2675,8 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.draft_vocab =*/ &draft_vocab,
+        /*.draft_vocab_size =*/ draft_vocab.size(),
     };
 }
 
@@ -3886,6 +4077,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+void llama_set_draft_vocab(llama_context * ctx, const llama_token * tokens, size_t count) {
+    ctx->set_draft_vocab(tokens,count);
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {

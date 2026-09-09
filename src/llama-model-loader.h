@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+using llama_buf_map = std::unordered_map<uint32_t, std::vector<ggml_backend_buffer_t>>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -116,6 +116,11 @@ struct llama_model_loader {
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
+    const struct llama_model * model_shared = nullptr;
+
+    // cached nextn_shared_target_tensors, -1 until first read
+    int shared_target_tensors = -1;
 
     llama_files files;
     llama_ftype ftype;
@@ -238,11 +243,18 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    // token_embd/output/output_norm from the target. null unless the file declares the flag.
+    struct ggml_tensor * borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
+
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+
+    // near-adjacent runs are merged, so a normal layout yields one range and only a large
+    // foreign tensor splits it
+    void get_mapping_ranges(std::vector<std::pair<size_t, size_t>> & ranges, void ** addr, int idx, ggml_context * ctx) const;
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;

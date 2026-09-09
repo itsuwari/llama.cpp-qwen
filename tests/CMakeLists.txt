@@ -386,3 +386,11 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+add_executable(test-r95-qsa-replay test-r95-qsa-replay.cpp)
+target_link_libraries(test-r95-qsa-replay PRIVATE llama)
+target_include_directories(test-r95-qsa-replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+llama_build_and_test(test-sep09-sampling-cost.cpp)
+llama_build(test-sep09-target-replay.cpp)
+target_include_directories(test-sep09-target-replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)

@@ -1,3 +1,4 @@
+#include <typeinfo>
 #include "llama-graph.h"
 
 #include "llama-impl.h"
@@ -1405,6 +1406,18 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
+        static int count=0;
+        if(std::getenv("LLAMA_R95_REUSE_TRACE") && params.ubatch.n_tokens<=16 && params.gtype!=LLM_GRAPH_TYPE_DECODER_MTP && count++<32) {
+            const auto & old=this->params;
+            fprintf(stderr,"R95_PARAM old_n=%u new_n=%u old_seq_tokens=%u new_seq_tokens=%u old_seqs=%u new_seqs=%u old_unq=%u new_unq=%u owned=%d/%d equal=%d/%d outputs=%u/%u types=%d/%d samplers=%zu/%zu emb=%d/%d nextn=%d/%d masked=%d/%d vocab=%zu/%zu\n",
+                old.ubatch.n_tokens,params.ubatch.n_tokens,old.ubatch.n_seq_tokens,params.ubatch.n_seq_tokens,
+                old.ubatch.n_seqs,params.ubatch.n_seqs,old.ubatch.n_seqs_unq,params.ubatch.n_seqs_unq,
+                int(bool(old.ubatch.data)),int(bool(params.ubatch.data)),int(old.ubatch.equal_seqs()),int(params.ubatch.equal_seqs()),
+                old.n_outputs,params.n_outputs,int(old.gtype),int(params.gtype),old.samplers.size(),params.samplers.size(),
+                int(old.cparams.embeddings),int(params.cparams.embeddings),int(old.cparams.embeddings_nextn),int(params.cparams.embeddings_nextn),
+                int(old.cparams.embeddings_nextn_masked),int(params.cparams.embeddings_nextn_masked),old.draft_vocab_size,params.draft_vocab_size);
+        }
+
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1420,6 +1433,11 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+        static int r95_trace_count=0;
+        if(!cur && params.ubatch.n_tokens<=16 && params.gtype!=LLM_GRAPH_TYPE_DECODER_MTP &&
+           std::getenv("LLAMA_R95_REUSE_TRACE") && r95_trace_count++<24)
+            fprintf(stderr,"R95_REUSE_FAIL input=%s n=%u\n",typeid(*input).name(),params.ubatch.n_tokens);
+
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
@@ -2019,6 +2037,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // For finite logits, top-k commutes with softmax. Renormalizing selected
+    // probabilities cancels the full-vocabulary denominator exactly in real
+    // arithmetic. The selected mass is >= k/E, so the old clamp stays inactive.
+    if (getenv("LLAMA_QWEN_ROUTER_SELECTED_SOFTMAX") && arch == LLM_ARCH_QWEN4EXP &&
+        gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX && norm_w &&
+        exp_probs_b == nullptr && selected_experts_in == nullptr && hparams.n_expert_groups <= 1 &&
+        n_expert_used > 0 && double(n_expert_used)/double(n_expert) > 6.103515625e-5) {
+        gating_op = LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT;
+        norm_w = false;
+    }
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2106,8 +2135,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        if (arch == LLM_ARCH_QWEN4EXP) {
+            selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        } else {
+            selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
@@ -2598,7 +2631,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_indices,
+         ggml_tensor * kv_mask) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2613,6 +2648,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    GGML_ASSERT((kv_indices == nullptr) == (kv_mask == nullptr));
+    GGML_ASSERT(kv_indices == nullptr || use_flash_attn);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2629,14 +2666,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        if (kv_indices) {
+            GGML_ASSERT(sinks == nullptr);
+            GGML_ASSERT(hparams.f_max_alibi_bias == 0.0f);
+            cur = ggml_flash_attn_ext_indexed(ctx0, q, k, v, kv_indices, kv_mask, kq_scale,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_QSA_ATTN, cur, il});
+        } else {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_prec_set_acc(cur, GGML_PREC_F32);
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
+        }
 
         if (v_mla) {
 #if 0
@@ -2828,8 +2873,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
-llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
-    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(const llama_kv_cache_context * cache) const {
+    const auto * mctx_cur = cache ? cache : static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
@@ -2848,7 +2893,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * kv_indices,
+        ggml_tensor * kv_mask) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -2884,7 +2931,27 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    static const int draft_window = std::getenv("LLAMA_MTP_ATTN_WINDOW") ?
+                                    std::atoi(std::getenv("LLAMA_MTP_ATTN_WINDOW")) : 0;
+    if (draft_window >= 256 && draft_window <= 4096 &&
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+        cparams.flash_attn && ubatch.n_seqs == 1 && n_tokens <= 8 &&
+        kv_indices == nullptr && kq_b == nullptr && kq_mask != nullptr &&
+        k->ne[2] == v->ne[2] && kq_mask->ne[0] == k->ne[2] &&
+        v->nb[1] <= v->nb[2]) {
+        // Retain an extra cache-padding block so the newest valid keys are present.
+        const int64_t keep = std::min<int64_t>(k->ne[2], GGML_PAD(draft_window, 256) + 256);
+        const int64_t start = k->ne[2] - keep;
+        k = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], keep, k->ne[3],
+                        k->nb[1], k->nb[2], k->nb[3], start*k->nb[2]);
+        v = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], keep, v->ne[3],
+                        v->nb[1], v->nb[2], v->nb[3], start*v->nb[2]);
+        kq_mask = ggml_view_4d(ctx0, kq_mask, keep, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                              kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], start*kq_mask->nb[0]);
+    }
+
+    ggml_tensor * cur = build_attn_mha(
+            q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, kv_indices, kv_mask);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

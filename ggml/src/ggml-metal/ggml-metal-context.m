@@ -52,6 +52,10 @@ struct ggml_metal {
 
     id<MTLCaptureScope> capture_scope;
 
+    bool lab_profile;
+    int lab_single_limit;
+    int lab_main_nodes;
+
     // command buffer state
     int n_cb;           // number of extra threads used to submit the command buffers
     int n_nodes_0;      // number of nodes submitted by the main thread
@@ -139,6 +143,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
+        res->lab_profile = getenv("GGML_METAL_LAB_PROFILE") != NULL;
+        res->lab_single_limit = getenv("GGML_METAL_LAB_SINGLE_LIMIT") ? atoi(getenv("GGML_METAL_LAB_SINGLE_LIMIT")) : 0;
+        res->lab_main_nodes = getenv("GGML_METAL_LAB_MAIN_NODES") ? atoi(getenv("GGML_METAL_LAB_MAIN_NODES")) : 0;
         res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
         res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
@@ -462,8 +469,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_FAILED;
     }
 
-    // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    const bool lab_profile = ctx->lab_profile;
+    const int lab_single_limit = ctx->lab_single_limit;
+    const int lab_main_nodes = ctx->lab_main_nodes;
+    const int64_t lab_start = lab_profile ? ggml_time_us() : 0;
+
+    const int n_main = gf->n_nodes <= lab_single_limit ? gf->n_nodes :
+        (lab_main_nodes > 0 ? lab_main_nodes : MAX(64, 0.1*gf->n_nodes));
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
@@ -548,7 +560,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
-        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+        const int n_cb_extra = ctx->n_nodes_1 == 0 ? 0 : n_cb;
+        for (int cb_idx = 0; cb_idx < n_cb_extra; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
 
@@ -568,7 +581,25 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
-        dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        dispatch_apply(n_cb_extra, ctx->d_queue, ctx->encode_async);
+
+        if (lab_profile) {
+            const int64_t lab_encoded = ggml_time_us();
+            [ctx->cmd_buf_last waitUntilCompleted];
+            double gpu_us = 0.0;
+            for (int i = 0; i <= n_cb; ++i) {
+                if (i != n_cb && i >= n_cb_extra) {
+                    continue;
+                }
+                id<MTLCommandBuffer> cb = ctx->cmd_bufs[i].obj;
+                if (cb.status == MTLCommandBufferStatusCompleted) {
+                    gpu_us += (cb.GPUEndTime - cb.GPUStartTime)*1e6;
+                }
+            }
+            fprintf(stderr, "LABPROFILE nodes=%d encode_us=%lld wait_us=%lld gpu_us=%.3f\n",
+                    gf->n_nodes, (long long) (lab_encoded - lab_start),
+                    (long long) (ggml_time_us() - lab_encoded), gpu_us);
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -683,7 +714,11 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     if (ctx->n_cb != n_cb) {
-        ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
+        const char * lab_n_cb = getenv("GGML_METAL_LAB_N_CB");
+    if (lab_n_cb) {
+        n_cb = MAX(1, atoi(lab_n_cb));
+    }
+    ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
         if (ctx->n_cb > 2) {
             GGML_LOG_WARN("%s: n_cb = %d, using n_cb > 2 is not recommended and can degrade the performance in some cases\n", __func__, n_cb);

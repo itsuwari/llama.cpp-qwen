@@ -1,4 +1,5 @@
 #pragma once
+#include "h90-rejection.h"
 
 #include "llama.h"
 
@@ -123,3 +124,7 @@ struct common_sampler_deleter {
 };
 
 typedef std::unique_ptr<common_sampler, common_sampler_deleter> common_sampler_ptr;
+
+std::vector<llama_token> common_sampler_sample_and_accept_h90(
+    common_sampler * smpl,llama_context * ctx,const std::vector<int> & idxs,
+    const llama_tokens & draft,const std::vector<h90_draft_step> & q,std::mt19937 & rng);

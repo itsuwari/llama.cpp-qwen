@@ -49,6 +49,10 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_QWEN4EXP_HC_REDUCE,
+    LLM_FUSED_OP_QWEN4EXP_HC_COMBINE,
+    LLM_FUSED_OP_QSA_BLOCK_SCORE,
+    LLM_FUSED_OP_QSA_ATTN,
 };
 
 enum llm_ffn_op_type : int {
@@ -809,10 +813,14 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    const std::vector<llama_token> * draft_vocab = nullptr;
+    size_t draft_vocab_size = 0;
+
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (draft_vocab_size != other.draft_vocab_size || draft_vocab != other.draft_vocab) return false;
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -1187,7 +1195,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kv_indices = nullptr,
+            ggml_tensor * kv_mask = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1205,7 +1215,7 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_kv * build_attn_inp_kv() const;
+    llm_graph_input_attn_kv * build_attn_inp_kv(const llama_kv_cache_context * cache = nullptr) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
@@ -1219,7 +1229,9 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kv_indices = nullptr,
+            ggml_tensor * kv_mask = nullptr) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

@@ -5,12 +5,15 @@
 #include "ggml-backend-impl.h"
 
 #include <vector>
+#include <cstdlib>
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t ne01 = op->src[0]->ne[1];
     const int64_t ne11 = op->src[1]->ne[1];
 
-    return !ggml_is_transposed(op->src[0]) &&
+    return ne01 > 4 &&
+           !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
            has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
 }
@@ -205,6 +208,7 @@ struct node_info {
     ggml_tensor * node;
 
     std::vector<ggml_tensor *> fused;
+    bool track_all_writes = false;
 
     ggml_op op() const {
         return node->op;
@@ -222,6 +226,22 @@ struct node_info {
         fused.push_back(t);
     }
 };
+
+static bool ggml_metal_is_gdn_cache_cpy(const ggml_tensor * node) {
+    if (node->op != GGML_OP_CPY || node->src[0] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * src = node->src[0];
+    const ggml_tensor * gdn = src->view_src;
+    if (src->op != GGML_OP_VIEW || gdn == nullptr || gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return false;
+    }
+
+    const ggml_tensor * v = gdn->src[2];
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, v->ne[0]*v->ne[1]*v->ne[2]*v->ne[3]);
+    return src->view_offs == tail_off;
+}
 
 static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
     // helper to add node src and dst ranges
@@ -245,6 +265,17 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
+        if (node.track_all_writes) {
+            if (!ggml_mem_ranges_add_dst(mrs, node.node)) {
+                return false;
+            }
+            for (const auto * fused : node.fused) {
+                if (!ggml_mem_ranges_add_dst(mrs, fused)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         return ggml_mem_ranges_add_dst(mrs, node.dst());
     };
 
@@ -268,6 +299,17 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
+        if (node.track_all_writes) {
+            if (!ggml_mem_ranges_check_dst(mrs, node.node)) {
+                return false;
+            }
+            for (const auto * fused : node.fused) {
+                if (!ggml_mem_ranges_check_dst(mrs, fused)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         return ggml_mem_ranges_check_dst(mrs, node.dst());
     };
 
@@ -332,6 +374,13 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         //
         // note: we can always add empty nodes to the concurrent set as they don't read nor write anything
         if (!node0.is_empty() && !h_check(mrs0, node0)) {
+            if (ggml_metal_is_gdn_cache_cpy(node0.node)) {
+                ggml_mem_ranges_reset(mrs0);
+                h_add(mrs0, node0);
+                res.push_back(i0);
+                continue;
+            }
+
             // this will hold the set of memory ranges from the nodes that haven't been processed yet
             // if a node is not concurrent with this set, we cannot reorder it
             ggml_mem_ranges_reset(mrs1);
@@ -389,8 +438,123 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+// Keep implemented fusions atomic during the concurrency reorder. Every write
+// is tracked because an encoder boundary or a backend shape guard can still
+// select the unfused path. This also covers stateful fusions with two outputs.
+static int ggml_metal_preserve_fusion_span(const ggml_cgraph * gf, int begin) {
+    const ggml_tensor * first = gf->nodes[begin];
+    if (begin + 1 >= gf->n_nodes) {
+        return 1;
+    }
+    static const bool snapshots=std::getenv("GGML_METAL_CONV_SNAPSHOT_FUSE")!=nullptr;
+    if (snapshots && first->op==GGML_OP_CONCAT && first->ne[0]<=16) {
+        int last=begin, copies=0;
+        for (int j=begin+1;j<gf->n_nodes && j<begin+32 && copies<8;++j) {
+            const ggml_tensor * node=gf->nodes[j];
+            if (ggml_is_empty(node) || node->op==GGML_OP_VIEW || node->op==GGML_OP_RESHAPE ||
+                node->op==GGML_OP_PERMUTE || node->op==GGML_OP_TRANSPOSE) continue;
+            if (node->op!=GGML_OP_CPY || !node->src[0] || node->src[0]->view_src!=first) break;
+            last=j;
+            ++copies;
+        }
+        // Every member stays observable; the scheduler tracks all writes.
+        if (copies>=2) return last-begin+1;
+    }
+    const ggml_tensor * second = gf->nodes[begin + 1];
+    static const int gateup_rows = std::getenv("GGML_METAL_EXPERT_GATEUP") ? std::atoi(std::getenv("GGML_METAL_EXPERT_GATEUP")) : 0;
+    if ((gateup_rows==1 || gateup_rows==2 || gateup_rows==4) && first->op==GGML_OP_MUL_MAT_ID &&
+        first->src[0]->type==GGML_TYPE_Q4_K && first->src[2]->ne[1]<=8 && begin+2<gf->n_nodes) {
+        const ggml_tensor * last=gf->nodes[begin+2];
+        const ggml_op ops[]={GGML_OP_MUL_MAT_ID,GGML_OP_MUL_MAT_ID,GGML_OP_GLU};
+        const int output=begin+2;
+        if (second->op==GGML_OP_MUL_MAT_ID && last->op==GGML_OP_GLU &&
+            ggml_get_glu_op(last)==GGML_GLU_OP_SWIGLU &&
+            ggml_can_fuse_subgraph(gf,begin,3,ops,&output,1)) {
+            return 3;
+        }
+    }
+    static const bool rms_gate = std::getenv("GGML_METAL_RMS_GATE_FUSE") != nullptr;
+    if (rms_gate && first->op == GGML_OP_RMS_NORM) {
+        const ggml_op expected[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+        ggml_op ops[16];
+        int matched = 0;
+        int end = begin;
+        for (; end < gf->n_nodes && end < begin + 16 && matched < 4; ++end) {
+            const auto * node = gf->nodes[end];
+            ops[end - begin] = node->op;
+            if (ggml_op_is_empty(node->op)) {
+                continue;
+            }
+            if (node->op != expected[matched] ||
+                    (matched == 2 && ggml_get_unary_op(node) != GGML_UNARY_OP_SIGMOID)) {
+                break;
+            }
+            ++matched;
+        }
+        const int count = end - begin;
+        const int output = begin + count - 1;
+        if (matched == 4 && ggml_can_fuse_subgraph(gf, begin, count, ops, &output, 1)) {
+            return count;
+        }
+    }
+    if ((first->op == GGML_OP_RMS_NORM || first->op == GGML_OP_NORM) &&
+            second->op == GGML_OP_SCALE &&
+            ggml_can_fuse(gf, begin, { first->op, GGML_OP_SCALE })) {
+        return 2;
+    }
+    if (first->op == GGML_OP_SSM_CONV && second->op == GGML_OP_UNARY &&
+            std::getenv("GGML_METAL_CONV_SILU_FUSE") != nullptr &&
+            ggml_get_unary_op(second) == GGML_UNARY_OP_SILU &&
+            ggml_can_fuse(gf, begin, { GGML_OP_SSM_CONV, GGML_OP_UNARY })) {
+        return 2;
+    }
+    if (first->op == GGML_OP_SCALE && second->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(second) == GGML_UNARY_OP_SILU &&
+            ggml_can_fuse(gf, begin, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+        return 2;
+    }
+
+    int next = begin + 1;
+    while (next < gf->n_nodes && next < begin + 16 && ggml_op_is_empty(gf->nodes[next]->op)) {
+        ++next;
+    }
+    if (next >= gf->n_nodes || next >= begin + 16) {
+        return 1;
+    }
+    if (first->op == GGML_OP_GATED_DELTA_NET && ggml_metal_is_gdn_cache_cpy(gf->nodes[next]) &&
+            gf->nodes[next]->src[0]->view_src == first) {
+        return next - begin + 1;
+    }
+
+    int sigmoid = begin;
+    if (first->op == GGML_OP_MUL_MAT) {
+        sigmoid = next;
+    }
+    if (gf->nodes[sigmoid]->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(gf->nodes[sigmoid]) != GGML_UNARY_OP_SIGMOID) {
+        return 1;
+    }
+    next = sigmoid + 1;
+    while (next < gf->n_nodes && next < begin + 16 && ggml_op_is_empty(gf->nodes[next]->op)) {
+        ++next;
+    }
+    if (next >= gf->n_nodes || next >= begin + 16 ||
+            gf->nodes[next]->op != GGML_OP_QWEN4EXP_HC_REDUCE ||
+            gf->nodes[next]->src[1] != gf->nodes[sigmoid]) {
+        return 1;
+    }
+    const int count = next - begin + 1;
+    ggml_op ops[16];
+    for (int i = 0; i < count; ++i) {
+        ops[i] = gf->nodes[begin + i]->op;
+    }
+    const int output = begin + count - 1;
+    return ggml_can_fuse_subgraph(gf, begin, count, ops, &output, 1) ? count : 1;
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
     constexpr int MAX_FUSE = 16;
+    static const bool preserve_fusions = std::getenv("GGML_METAL_FUSION_AWARE_SCHEDULE") != nullptr;
 
     const int n = gf->n_nodes;
 
@@ -407,6 +571,18 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             /*.node =*/ gf->nodes[i],
             /*.fused =*/ {},
         };
+
+        if (preserve_fusions) {
+            const int count = ggml_metal_preserve_fusion_span(gf, i);
+            if (count > 1) {
+                node.track_all_writes = true;
+                for (int k = 1; k < count; ++k) {
+                    node.add_fused(gf->nodes[++i]);
+                }
+                nodes.push_back(std::move(node));
+                continue;
+            }
+        }
 
         // fuse only ops that start with these operations
         // can be expanded when needed

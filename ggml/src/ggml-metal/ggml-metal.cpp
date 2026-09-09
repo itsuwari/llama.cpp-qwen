@@ -10,6 +10,13 @@
 
 #include <mutex>
 #include <string>
+#include <map>
+#include <tuple>
+#include <vector>
+#include <stdexcept>
+#include <cstring>
+#include <cstdlib>
+#include <cstdint>
 
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
@@ -21,6 +28,172 @@ static int g_devices = 1;
 // forward declaration
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer);
 
+
+// Optional lossless read-only Q8 storage: all signed quants, then all half scales.
+// Cache lifetime follows the original backend buffer and all host mutations invalidate it.
+struct h90_soa_entry { ggml_metal_buffer_t storage; ggml_metal_buffer_id id; size_t bytes; };
+using h90_soa_key = std::tuple<uintptr_t, int64_t, int64_t>;
+static std::mutex h90_soa_mutex;
+static std::map<ggml_backend_buffer_t, std::map<h90_soa_key,h90_soa_entry>> h90_soa_cache;
+static size_t h90_soa_bytes = 0;
+
+// A separate cache stores F32 weights only when their BF16 expansion is exact.
+// Null storage is a cached rejection. Owners and mutation hooks match Q8 SoA.
+static std::mutex exact_bf16_mutex;
+static std::map<ggml_backend_buffer_t, std::map<h90_soa_key,h90_soa_entry>> exact_bf16_cache;
+static size_t exact_bf16_bytes = 0;
+
+static void exact_bf16_invalidate(ggml_backend_buffer_t buffer) {
+    static const bool enabled = std::getenv("GGML_METAL_EXACT_BF16") != nullptr;
+    if (!enabled) return;
+    std::vector<ggml_metal_buffer_t> release;
+    {
+        std::lock_guard<std::mutex> lock(exact_bf16_mutex);
+        auto found = exact_bf16_cache.find(buffer);
+        if (found == exact_bf16_cache.end()) return;
+        for (const auto & item : found->second) {
+            if (item.second.storage) release.push_back(item.second.storage);
+            exact_bf16_bytes -= item.second.bytes;
+        }
+        exact_bf16_cache.erase(found);
+    }
+    for (auto storage : release) ggml_metal_buffer_free(storage);
+}
+
+bool ggml_metal_f32_bf16_get(const ggml_tensor * w, ggml_metal_buffer_id * id) {
+    static const bool enabled = std::getenv("GGML_METAL_EXACT_BF16") != nullptr;
+    static const bool test = std::getenv("GGML_METAL_EXACT_BF16_TEST") != nullptr;
+    if (!enabled || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+        w->ne[2] != 1 || w->ne[3] != 1 || ggml_nelements(w) < 100000) return false;
+    auto owner = w->view_src ? w->view_src->buffer : w->buffer;
+    if (!owner || !ggml_backend_buffer_is_metal(owner) ||
+        !ggml_metal_buffer_is_shared((ggml_metal_buffer_t)owner->context) ||
+        (ggml_backend_buffer_get_usage(owner) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+         !(test && w->op == GGML_OP_NONE))) return false;
+    const h90_soa_key key{reinterpret_cast<uintptr_t>(w->data),w->ne[0],w->ne[1]};
+    std::lock_guard<std::mutex> lock(exact_bf16_mutex);
+    auto & entries = exact_bf16_cache[owner];
+    auto found = entries.find(key);
+    if (found != entries.end()) {
+        if (!found->second.storage) return false;
+        *id = found->second.id;
+        return true;
+    }
+    const size_t count = ggml_nelements(w), bytes = count*sizeof(uint16_t);
+    const auto * src = static_cast<const uint8_t *>(w->data);
+    bool exact = bytes <= (size_t(1)<<30) - exact_bf16_bytes;
+    for (size_t i=0; exact && i<count; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits,src+i*sizeof(float),sizeof(bits));
+        const uint32_t exponent = bits & 0x7f800000u;
+        // Preserve signed zero; reject NaNs, infinities and subnormals.
+        exact = (bits & 0xffffu)==0 && exponent!=0x7f800000u &&
+                (exponent!=0 || (bits & 0x007fffffu)==0);
+    }
+    if (!exact) {
+        entries.emplace(key,h90_soa_entry{});
+        return false;
+    }
+    auto dev = (ggml_metal_device_t)owner->buft->device->context;
+    auto storage = ggml_metal_buffer_init(dev,bytes,true);
+    if (!storage || !ggml_metal_buffer_is_shared(storage)) {
+        if (storage) ggml_metal_buffer_free(storage);
+        entries.emplace(key,h90_soa_entry{});
+        return false;
+    }
+    auto * dst = static_cast<uint16_t *>(ggml_metal_buffer_get_base(storage));
+    for (size_t i=0; i<count; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits,src+i*sizeof(float),sizeof(bits));
+        dst[i] = uint16_t(bits>>16);
+    }
+    ggml_tensor clone = *w;
+    clone.type = GGML_TYPE_BF16; clone.data = dst; clone.view_src = nullptr; clone.view_offs = 0;
+    for (int d=0; d<GGML_MAX_DIMS; ++d) clone.nb[d] /= 2;
+    *id = ggml_metal_buffer_get_id(storage,&clone);
+    entries.emplace(key,h90_soa_entry{storage,*id,bytes});
+    exact_bf16_bytes += bytes;
+    if (std::getenv("GGML_METAL_EXACT_BF16_CHECK")) {
+        for (size_t i=0; i<count; ++i) {
+            uint32_t bits;
+            std::memcpy(&bits,src+i*sizeof(float),sizeof(bits));
+            GGML_ASSERT(bits == (uint32_t(dst[i])<<16));
+        }
+        GGML_LOG_INFO("EXACT_BF16 tensor=%s elements=%zu checked=1\n",w->name,count);
+    }
+    return true;
+}
+
+static void h90_soa_invalidate(ggml_backend_buffer_t buffer) {
+    exact_bf16_invalidate(buffer);
+    static const bool enabled = std::getenv("GGML_METAL_Q8_SOA") != nullptr;
+    if (!enabled) return;
+    std::vector<ggml_metal_buffer_t> release;
+    {
+        std::lock_guard<std::mutex> lock(h90_soa_mutex);
+        auto found=h90_soa_cache.find(buffer);
+        if (found==h90_soa_cache.end()) return;
+        for (const auto & item:found->second) {
+            release.push_back(item.second.storage);
+            h90_soa_bytes-=item.second.bytes;
+        }
+        h90_soa_cache.erase(found);
+    }
+    for (auto storage:release) ggml_metal_buffer_free(storage);
+}
+
+bool ggml_metal_q8_soa_enabled(const ggml_tensor * op, int nxpsg) {
+    static const bool enabled = std::getenv("GGML_METAL_Q8_SOA") != nullptr;
+    static const bool test = std::getenv("GGML_METAL_Q8_SOA_TEST") != nullptr;
+    if (!enabled || nxpsg>=0 || std::getenv("GGML_METAL_BLOCK_LOW_REG")) return false;
+    const auto * w=op->src[0]; const auto * x=op->src[1];
+    if (w->type!=GGML_TYPE_Q8_0 || w->ne[0]%32 || !ggml_is_contiguous(w) ||
+        w->ne[2]!=1 || w->ne[3]!=1 || x->ne[2]!=1 || x->ne[3]!=1 ||
+        x->ne[1]<2 || x->ne[1]>8) return false;
+    auto buffer=w->view_src ? w->view_src->buffer : w->buffer;
+    return buffer && ggml_backend_buffer_is_metal(buffer) &&
+        ggml_metal_buffer_is_shared((ggml_metal_buffer_t)buffer->context) &&
+        (ggml_backend_buffer_get_usage(buffer)==GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+         (test && w->op==GGML_OP_NONE));
+}
+
+ggml_metal_buffer_id ggml_metal_q8_soa_get(const ggml_tensor * w) {
+    auto owner=w->view_src ? w->view_src->buffer : w->buffer;
+    const h90_soa_key key{reinterpret_cast<uintptr_t>(w->data),w->ne[0],w->ne[1]};
+    std::lock_guard<std::mutex> lock(h90_soa_mutex);
+    auto & entries=h90_soa_cache[owner];
+    auto found=entries.find(key);
+    if (found!=entries.end()) return found->second.id;
+    GGML_ASSERT(w->type==GGML_TYPE_Q8_0 && ggml_type_size(w->type)==34);
+    GGML_ASSERT(ggml_is_contiguous(w) && w->ne[2]==1 && w->ne[3]==1);
+    const size_t size=ggml_nbytes(w), blocks=ggml_nelements(w)/32;
+    if (size>size_t(8)*1024*1024*1024-h90_soa_bytes)
+        throw std::runtime_error("Q8 SoA cache exceeded explicit 8 GiB limit");
+    auto dev=(ggml_metal_device_t)owner->buft->device->context;
+    auto storage=ggml_metal_buffer_init(dev,size,true);
+    if (!storage || !ggml_metal_buffer_is_shared(storage)) {
+        if(storage) ggml_metal_buffer_free(storage);
+        throw std::runtime_error("Q8 SoA shared allocation failed");
+    }
+    auto * dst=(uint8_t *)ggml_metal_buffer_get_base(storage);
+    const auto * src=(const uint8_t *)w->data;
+    for (size_t block=0;block<blocks;++block) {
+        std::memcpy(dst+32*block,src+34*block+2,32);
+        std::memcpy(dst+32*blocks+2*block,src+34*block,2);
+    }
+    if (std::getenv("GGML_METAL_Q8_SOA_CHECK")) {
+        for(size_t block=0;block<blocks;++block) {
+            GGML_ASSERT(std::memcmp(dst+32*block,src+34*block+2,32)==0);
+            GGML_ASSERT(std::memcmp(dst+32*blocks+2*block,src+34*block,2)==0);
+        }
+    }
+    ggml_tensor clone=*w; clone.data=dst;clone.view_src=nullptr;clone.view_offs=0;
+    const auto id=ggml_metal_buffer_get_id(storage,&clone);
+    entries.emplace(key,h90_soa_entry{storage,id,size});h90_soa_bytes+=size;
+    GGML_LOG_DEBUG("H90_SOA tensor=%s bytes=%zu cache_bytes=%zu\n",w->name,size,h90_soa_bytes);
+    return id;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // backend interface
 ////////////////////////////////////////////////////////////////////////////////
@@ -28,6 +201,7 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer);
 // shared buffer
 
 static void ggml_backend_metal_buffer_shared_free_buffer(ggml_backend_buffer_t buffer) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
@@ -44,6 +218,7 @@ static void * ggml_backend_metal_buffer_shared_get_base(ggml_backend_buffer_t bu
 }
 
 static void ggml_backend_metal_buffer_shared_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
@@ -52,6 +227,7 @@ static void ggml_backend_metal_buffer_shared_memset_tensor(ggml_backend_buffer_t
 }
 
 static void ggml_backend_metal_buffer_shared_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
@@ -68,6 +244,7 @@ static void ggml_backend_metal_buffer_shared_get_tensor(ggml_backend_buffer_t bu
 }
 
 static bool ggml_backend_metal_buffer_shared_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
@@ -80,6 +257,7 @@ static bool ggml_backend_metal_buffer_shared_cpy_tensor(ggml_backend_buffer_t bu
 }
 
 static void ggml_backend_metal_buffer_shared_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
@@ -104,6 +282,7 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
 // private buffer
 
 static void ggml_backend_metal_buffer_private_free_buffer(ggml_backend_buffer_t buffer) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
@@ -120,6 +299,7 @@ static void * ggml_backend_metal_buffer_private_get_base(ggml_backend_buffer_t b
 }
 
 static void ggml_backend_metal_buffer_private_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
@@ -128,6 +308,7 @@ static void ggml_backend_metal_buffer_private_memset_tensor(ggml_backend_buffer_
 }
 
 static void ggml_backend_metal_buffer_private_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
@@ -144,6 +325,7 @@ static void ggml_backend_metal_buffer_private_get_tensor(ggml_backend_buffer_t b
 }
 
 static bool ggml_backend_metal_buffer_private_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
@@ -156,6 +338,7 @@ static bool ggml_backend_metal_buffer_private_cpy_tensor(ggml_backend_buffer_t b
 }
 
 static void ggml_backend_metal_buffer_private_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    h90_soa_invalidate(buffer);
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
@@ -221,6 +404,9 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
+        case GGML_OP_MUL_MAT:
+            res += ggml_metal_op_mul_mat_extra_split(tensor);
+            break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
@@ -233,6 +419,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
+            } break;
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            {
+                res += ggml_metal_op_flash_attn_ext_indexed_extra(tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:

@@ -846,7 +846,8 @@ struct ggml_backend_sched {
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
-    int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
+    static const int requested = getenv("GGML_SCHED_SPLIT_INPUTS") ? atoi(getenv("GGML_SCHED_SPLIT_INPUTS")) : 0;
+    int new_cap = requested >= 30 && requested <= 512 ? requested : GGML_SCHED_MAX_SPLIT_INPUTS;
     if (split->inputs_capacity > 0) {
         new_cap = 2*split->inputs_capacity;
         GGML_LOG_DEBUG("%s: increasing split inputs capacity from %d to %d\n", __func__, split->inputs_capacity, new_cap);
@@ -2102,6 +2103,7 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:

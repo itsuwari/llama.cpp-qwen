@@ -1,5 +1,34 @@
 #include "common.h"
 
+// Small decode batches have too few tokens to fill a SIMDgroup. Parallelize
+// channels instead, so adjacent lanes write adjacent output elements. Optional
+// SiLU keeps the convolution result in a register and removes its round trip.
+template<bool SILU>
+kernel void kernel_ssm_conv_channels(
+        constant ggml_metal_kargs_ssm_conv & a,
+        device const char * source,
+        device const char * weights,
+        device char * output,
+        uint3 p [[thread_position_in_grid]]) {
+    if (p.x >= uint(a.ne01) || p.y >= uint(a.ne1) || p.z >= uint(a.ne02)) {
+        return;
+    }
+    device const float * s = (device const float *)(source + p.x*a.nb01 + p.y*a.nb00 + p.z*a.nb02);
+    device const float * w = (device const float *)(weights + p.x*a.nb11);
+    float value = 0.0f;
+    // Preserve the existing scalar accumulation order for speculative batches.
+    for (int k = 0; k < a.ne10; ++k) {
+        value += s[k]*w[k];
+    }
+    if (SILU) {
+        value = value/(1.0f + exp(-value));
+    }
+    *((device float *)(output + p.x*a.nb0 + p.y*a.nb1 + p.z*a.nb2)) = value;
+}
+typedef decltype(kernel_ssm_conv_channels<false>) ssm_conv_channels_t;
+template [[host_name("kernel_ssm_conv_channels_f32")]] kernel ssm_conv_channels_t kernel_ssm_conv_channels<false>;
+template [[host_name("kernel_ssm_conv_channels_silu_f32")]] kernel ssm_conv_channels_t kernel_ssm_conv_channels<true>;
+
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,

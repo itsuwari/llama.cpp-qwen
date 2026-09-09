@@ -114,6 +114,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_draft_vocab(const llama_token * tokens, size_t count);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -217,6 +218,8 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    std::vector<llama_token> draft_vocab;
+
     //
     // output
     //
@@ -366,6 +369,17 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Each small decode shape owns its graph and scheduler allocations.
+    // Shared model/KV tensors remain in the original context memory module.
+    struct h90_shape_slot {
+        ggml_backend_sched_ptr scheduler;
+        llm_graph_result_ptr graph;
+    };
+    std::map<uint32_t, h90_shape_slot> h90_shape_bank;
+    uint32_t h90_active_shape = 0;
+    uint64_t h90_shape_switches = 0;
+
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
